@@ -115,6 +115,12 @@ class Go2MPCController:
               f"α={params.alpha:.1e}  μ={params.mu}")
         print("MPC mass:", self.p.mass)
         print("MuJoCo total mass:", float(self.model.body_mass.sum()))
+        trunk_id = 1   # base_link (from config.py)
+        print("MuJoCo trunk mass:", float(self.model.body_mass[trunk_id]))
+        print("MuJoCo trunk inertia:", self.model.body_inertia[trunk_id])
+
+        
+
 
     # ── Helper: rotate body-frame commands into world frame ──────────────────
     def _cmd_world_frame(self, state: RobotState):

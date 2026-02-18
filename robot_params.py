@@ -11,12 +11,12 @@ import numpy as np
 
 @dataclass
 class Go2Params:
-    mass : float = 15.0
+    mass : float = 15.206408
     g    : float = 9.81
 
-    Ixx  : float = 0.0468
-    Iyy  : float = 0.2447
-    Izz  : float = 0.2547
+    Ixx  : float = 0.107027
+    Iyy  : float = 0.0980771
+    Izz  : float = 0.0244531
 
     # State order: [φ, θ, ψ,  px, py, pz,  ωx, ωy, ωz,  vx, vy, vz,  −g]
     #               0  1  2   3   4   5    6   7   8    9  10  11   12
