@@ -396,6 +396,10 @@ class Go2MPCController:
         U_opt     = self.mpc.solve(H, g, C, lb, ub)
 
         self._grf = U_opt[0:12].reshape(4, 3)
+        new_grf = U_opt[0:12].reshape(4, 3)
+        # Exponential smoothing (critical for stable trot)
+        beta = 0.6
+        self._grf = beta * new_grf + (1 - beta) * self._grf
 
         if DEBUG_LEVEL >= 3:
             total_fz = self._grf[:, 2].sum()

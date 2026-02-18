@@ -105,7 +105,9 @@ def load_and_filter():
 
     print(f"[Filter] kept {len(df_valid)}/{len(df)} rows  "
           f"(t = {df_valid['t'].iloc[0]:.2f} → {df_valid['t'].iloc[-1]:.2f} s)")
-    return df_valid
+    df_c = df_valid[df_valid["phase"] == "C"].copy()
+    print(f"[Filter] Phase C only: {len(df_c)} rows")
+    return df_c
 
 
 # ── Individual plot functions ─────────────────────────────────────────────────

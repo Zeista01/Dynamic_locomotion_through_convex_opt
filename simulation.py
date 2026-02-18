@@ -66,6 +66,9 @@ class Go2Simulation:
     # ── Reset ─────────────────────────────────────────────────────────────────
 
     def reset(self) -> None:
+        import os
+        if os.path.exists(LOG_FILE):
+            os.remove(LOG_FILE)
         """Reset MuJoCo state and controller internal state."""
         mujoco.mj_resetData(self.model, self.data)
         mujoco.mj_forward(self.model, self.data)
