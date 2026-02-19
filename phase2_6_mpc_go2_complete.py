@@ -83,8 +83,8 @@ from simulation import Go2Simulation
 if __name__ == "__main__":
     sim = Go2Simulation(
         xml         = XML_PATH,
-        K           = 10,        # horizon: 10 steps × 30 ms = 300 ms lookahead
-        mpc_dt      = 0.030,     # MPC update rate: ~33 Hz
+        K           = 15,        # horizon: 10 steps × 30 ms = 300 ms lookahead
+        mpc_dt      = 0.025,     # MPC update rate: ~33 Hz
         gait_period = 0.40,      # 400 ms trot period (2.5 Hz)
         duty        = 0.50,      # 50% stance fraction
     )

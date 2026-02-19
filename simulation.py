@@ -66,6 +66,9 @@ class Go2Simulation:
     # ── Reset ─────────────────────────────────────────────────────────────────
 
     def reset(self) -> None:
+        import os
+        if os.path.exists(LOG_FILE):
+            os.remove(LOG_FILE)
         """Reset MuJoCo state and controller internal state."""
         mujoco.mj_resetData(self.model, self.data)
         mujoco.mj_forward(self.model, self.data)
@@ -208,6 +211,12 @@ class Go2Simulation:
         print("-" * len(hdr))
 
         with mujoco.viewer.launch_passive(self.model, self.data) as viewer:
+            # ── Chase camera: follow robot base ───────────────────────────
+            viewer.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
+            viewer.cam.trackbodyid = 1      # base_link (from config.py)
+            viewer.cam.distance = 2.8
+            viewer.cam.azimuth = 180
+            viewer.cam.elevation = -20
             last_p = -1.0
             while viewer.is_running() and self.data.time < duration:
                 t = self.data.time

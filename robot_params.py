@@ -11,12 +11,12 @@ import numpy as np
 
 @dataclass
 class Go2Params:
-    mass : float = 15.0
+    mass : float = 15.206408
     g    : float = 9.81
 
-    Ixx  : float = 0.0468
-    Iyy  : float = 0.2447
-    Izz  : float = 0.2547
+    Ixx  : float = 0.107027
+    Iyy  : float = 0.0980771
+    Izz  : float = 0.0244531
 
     # State order: [φ, θ, ψ,  px, py, pz,  ωx, ωy, ωz,  vx, vy, vz,  −g]
     #               0  1  2   3   4   5    6   7   8    9  10  11   12
@@ -32,16 +32,16 @@ class Go2Params:
     # Those caused the MPC to generate aggressive corrective forces that
     # destabilised the trot within 2 gait cycles (confirmed from debug log).
     Q: np.ndarray = field(default_factory=lambda: np.array([
-         10.,  20.,   1.,   # roll(φ), pitch(θ), yaw(ψ)
-          1.,   1.,  50.,   # px, py, pz
-          1.,   1.,   1.,   # ωx, ωy, ωz
-          2.,   2.,   1.,   # vx, vy, vz
-          0.,             # −g
+          10., 20., 1.,
+            1.,  1., 80.,
+            1.,  1.,  1.,
+            2.,  2.,  5.,
+            0.    # −g
     ], dtype=float))
 
-    alpha: float = 1e-4
+    alpha: float = 3e-4
 
-    mu   : float = 0.6
+    mu   : float = 0.7
     f_min: float =  5.0
     f_max: float = 200.0
 
