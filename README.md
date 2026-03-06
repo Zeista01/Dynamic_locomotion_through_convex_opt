@@ -11,6 +11,10 @@ Deployed on the **Unitree Go2** quadruped in **MuJoCo**, achieving:
 
 ---
 
+## Documentation
+See the full documentation here:  
+[Technical Documentation (PDF)](https://drive.google.com/file/d/1cK1LNhObhayhB2hSiA99TCnudxVhrlKj/view?usp=sharing/preview)
+
 ## Results
 
 | Scenario | Description |
