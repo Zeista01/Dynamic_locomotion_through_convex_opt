@@ -46,8 +46,16 @@ class Go2Simulation:
     def __init__(self, xml: str = XML_PATH,
                  K: int = 10, mpc_dt: float = 0.030,
                  gait_period: float = 0.40, duty: float = 0.50,
-                 params: Go2Params = GO2):
-
+                 params: Go2Params = GO2,
+                 terrain_mode: str = "flat"):
+        """
+        Parameters
+        ----------
+        terrain_mode : str
+            "flat"   — original flat-ground behaviour (default, unchanged).
+            "stairs" — terrain-aware controller for stair climbing.
+            "uneven" — terrain-aware controller for uneven ground.
+        """
         print(f"\nLoading model: {xml}")
         self.model = mujoco.MjModel.from_xml_path(xml)
         self.data  = mujoco.MjData(self.model)
@@ -57,6 +65,7 @@ class Go2Simulation:
             K=K, mpc_dt=mpc_dt,
             gait_period=gait_period, duty=duty,
             params=params,
+            terrain_mode=terrain_mode,
         )
 
         print(f"Physics dt = {self.model.opt.timestep*1e3:.1f} ms  "
@@ -85,8 +94,13 @@ class Go2Simulation:
         c._pz_integral   = 0.0
         c._pz_last_t     = 0.0
         c._warmup_done   = False
+        c._pitch_ref_smooth = 0.0
         c._phase_c_start = None
         c._phase_b_start = None
+        # Reset height setpoints so viewer run doesn't inherit crash-state values.
+        from config import NOMINAL_HEIGHT
+        c.pz_des             = NOMINAL_HEIGHT
+        c._nominal_clearance = NOMINAL_HEIGHT
         # BUG FIX: re-apply gravity pre-warm on reset so runs after the first
         # don't start from the stale end-state _grf of the previous run.
         _fz0 = c.p.mass * c.p.g / 4.0
@@ -94,6 +108,22 @@ class Go2Simulation:
         # Reset contact smoother buffer
         c.estimator._cf_buf[:] = 0.0
         c.estimator._cf_idx    = 0
+        # Reset terrain estimator — reset data AND mode back to "flat".
+        # BUG FIX: previously only reset data (terrain_z=0, foot_z=0) but
+        # kept the mode from the previous run.  If the previous run switched
+        # to "stairs", the new run starts with mode="stairs" → 18cm swing
+        # clearance on flat ground, terrain pz_des tracking active, early
+        # touchdown active — all wrong before stairs are reached.
+        c.terrain.reset()
+        c.terrain.set_mode("flat")
+        # BUG FIX: reset swing controller transient state.
+        # _early_touchdown flags carry over between runs: after first run
+        # crashed with FL/RR early-touchdown, viewer run shows et=T..T from
+        # t=0, because notify_lift is never called during Phase A/B to reset them.
+        c.swing._early_touchdown[:] = False
+        c.swing._swing_start_t.clear()
+        c.swing._swing_traj.clear()
+        c.swing._ground_z_est = 0.02
         self._log.clear()
 
     # ── Command interface ──────────────────────────────────────────────────────
@@ -211,6 +241,12 @@ class Go2Simulation:
         print("-" * len(hdr))
 
         with mujoco.viewer.launch_passive(self.model, self.data) as viewer:
+            # ── Chase camera: follow robot base ───────────────────────────
+            viewer.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
+            viewer.cam.trackbodyid = 1      # base_link (from config.py)
+            viewer.cam.distance = 2.8
+            viewer.cam.azimuth = 180
+            viewer.cam.elevation = -20
             last_p = -1.0
             while viewer.is_running() and self.data.time < duration:
                 t = self.data.time

@@ -31,12 +31,16 @@ class Go2Params:
     # Previous values (roll=100,pitch=200,pz=500,vx=100) were 10-50x too large.
     # Those caused the MPC to generate aggressive corrective forces that
     # destabilised the trot within 2 gait cycles (confirmed from debug log).
+    # State order: [φ, θ, ψ,  px, py, pz,  ωx, ωy, ωz,  vx, vy, vz,  −g]
+    # Matched to CasADi reference (centroidal_mpc.py):
+    #   roll=10, pitch=20, yaw=1, px=1, py=1, pz=50→150,
+    #   wx=1, wy=5, wz=1, vx=2, vy=2, vz=5
     Q: np.ndarray = field(default_factory=lambda: np.array([
           10., 20., 1.,
-            1.,  1., 80.,
-            1.,  1.,  1.,
+            1.,  1., 150.,
+            1.,   5.,  1.,
             2.,  2.,  5.,
-            0.    # −g
+            0.
     ], dtype=float))
 
     alpha: float = 3e-4

@@ -33,6 +33,7 @@ KEY FIXES in this version
 import time
 import numpy as np
 import mujoco
+from support_plane import SupportPlane
 
 from config import (
     LEG_NAMES, NUM_LEGS, TORQUE_LIMIT,
@@ -46,6 +47,7 @@ from dynamics import RigidBodyDynamics
 from mpc_solver import ConvexMPC
 from gait_scheduler import TrotGait
 from swing_controller import SwingController
+from terrain_estimator import TerrainEstimator
 from torque_utils import (
     grf_to_joint_torques, leg_to_ctrl, make_reference, PDStand, DebugLogger,
 )
@@ -65,19 +67,40 @@ class Go2MPCController:
     def __init__(self, model: mujoco.MjModel, data: mujoco.MjData,
                  K: int = 10, mpc_dt: float = 0.030,
                  gait_period: float = 0.40, duty: float = 0.50,
-                 params: Go2Params = GO2):
-
+                 params: Go2Params = GO2,
+                 terrain_mode: str = "flat"):
+        """
+        Parameters
+        ----------
+        terrain_mode : str
+            "flat"   — original flat-ground behaviour, unchanged (default).
+            "stairs" — terrain-aware: adaptive pz_des, larger swing clearance,
+                       early-touchdown detection.
+            "uneven" — same as "stairs" (future extension).
+        """
         self.model  = model
         self.data   = data
         self.K      = K
         self.mpc_dt = mpc_dt
         self.p      = params
 
+        # Terrain estimator — always starts in "flat" mode so Phase A/B/C
+        # settling is identical to the working flat-ground controller.
+        # Call switch_to_terrain_mode("stairs") mid-run when the robot
+        # approaches the stairs.  Store the requested mode so reset() can
+        # inform callers, but the estimator itself starts flat.
+        self._terrain_mode_target = terrain_mode
+        self.terrain = TerrainEstimator(mode="flat")
+
         self.estimator = StateEstimator(model, data)
         self.dyn       = RigidBodyDynamics(params)
+        self.support_plane = SupportPlane()
         self.mpc       = ConvexMPC(K, params)
         self.gait      = TrotGait(gait_period, duty)
-        self.swing     = SwingController(self.gait, model, data)
+        # Pass terrain estimator to swing controller so it can use
+        # terrain-aware touchdown z, swing clearance, and early touchdown.
+        self.swing     = SwingController(self.gait, model, data,
+                                         terrain=self.terrain)
         self.pd        = PDStand()
         self.logger    = DebugLogger(enabled=LOG_CSV)
 
@@ -85,6 +108,9 @@ class Go2MPCController:
         self.cmd_vy = 0.0
         self.cmd_wz = 0.0
         self.pz_des = NOMINAL_HEIGHT
+        # Nominal CoM clearance above terrain (set from settled height in Phase A).
+        # On flat ground this equals pz_des; on stairs: pz_des = terrain_z + this.
+        self._nominal_clearance: float = NOMINAL_HEIGHT
 
         _fz0 = params.mass * params.g / NUM_LEGS
         self._grf            = np.array([[0., 0., _fz0]] * NUM_LEGS, dtype=float)
@@ -99,11 +125,127 @@ class Go2MPCController:
         self._phase          = "A"
         self._recovery_mode  = False
         self._recovery_end   = 0.0
+        self._contacts_sched = np.ones(4, dtype=bool)   # logged contact schedule
 
         self._pz_integral    = 0.0
         self._pz_last_t      = 0.0
         self._phase_c_start  = None
         self._warmup_done    = False   # track when Phase C warmup ends
+        self._pitch_ref_smooth = 0.0   # FIX 8: IIR-smoothed pitch reference
+
+        # ── Stairs-specific Q weights ────────────────────────────────────────
+        # Tuned for scene_stairs_uniform.xml (6 cm riser / 28 cm tread):
+        #   pitch Q  100 (5× flat) — aggressively track incline reference;
+        #                             debug log shows 7-8° pitch oscillation
+        #                             pre-stairs that creates fragility.
+        #   roll  Q  25  (2.5× flat) — tighter lateral stability on steps.
+        #   pz    Q  100 (↑ from 80) — strong height tracking so the MPC
+        #                               raises the body promptly per step.
+        #   ωy    Q  3   (↑ from 1)  — damp pitch rate oscillations that
+        #                               cause the fatal nose-down pitch-over.
+        #   vz    Q  5   (↑ from 3, = flat) — the robot must actively
+        #                  control vertical velocity during ascent, not
+        #                  allow free vertical drift.
+        # State order: [φ, θ, ψ, px, py, pz, ωx, ωy, ωz, vx, vy, vz, -g]
+        # FIXED WEIGHTS (v3) — root-cause analysis from second failure run:
+        #
+        # RC1: py=1, vy=2 was NEVER fixed from original — zero lateral authority.
+        #      Diagonal stance (FL on step, RR on flat) creates lateral roll torque.
+        #      With py=1/vy=2, the MPC exerts ~0.16N vs 149N robot — negligible.
+        #      vy exploded to 0.38 m/s, causing full rollover at t=7.59s.
+        #      FIX: py=15, vy=15 — strong lateral position/velocity tracking.
+        #
+        # RC2: pitch=100 with diagonal stance generates huge anti-pitch moments
+        #      that manifest as roll couples in 2-leg stance (FL+RR).
+        #      This directly caused the vy→0.38 m/s tumble at first step contact.
+        #      FIX: pitch=50 — sufficient to track terrain slope without overcorrecting.
+        #
+        # RC3: vx=2 too weak — robot surged to 0.19→0.37 m/s despite cmd=0.08 m/s.
+        #      Forward surge means each step is hit at 2-4× the intended speed,
+        #      leaving no time for the MPC to regulate height/pitch per step.
+        #      FIX: vx=8 — strong enough to prevent forward surge on incline.
+        #
+        # State order: [φ, θ, ψ, px, py, pz, ωx, ωy, ωz, vx, vy, vz, -g]
+        # TUNED from log analysis (run ending t=9.5, roll=53°):
+        #
+        # pitch=50→80: pitch diverged +2°→+16° in 1.3s (t=6→7.3).
+        #   At 50, the MPC penalty for 16° pitch error is 50*(0.28)²=3.9.
+        #   At 80, it's 80*(0.28)²=6.3 — 60% stronger anti-pitch torque.
+        #   Not 100+ because that caused roll coupling in previous runs.
+        #
+        # ωy=5→12: pitch rate reached 10°/s = 0.17 rad/s sustained.
+        #   At ωy=5, penalty = 5*(0.17)²=0.15 — negligible damping.
+        #   At ωy=12, penalty = 12*(0.17)²=0.35 — meaningful damping
+        #   that prevents pitch from accelerating past ±10°.
+        #
+        # roll=25→35: roll hit 10° at t=8.1 with only 2 diagonal stance
+        #   feet.  Stronger roll tracking helps reject the geometric roll
+        #   torque from feet at different heights.
+        #
+        # vz=5→8: on stairs the robot must actively control vertical
+        #   velocity.  Debug log shows vz oscillating ±0.15 m/s, which
+        #   couples into pitch through the moment arm.
+        #
+        # TUNED from log analysis (pitch moment analysis at t=6.15):
+        #
+        # ROOT CAUSE: With pz Q=80 and pitch Q=80, the MPC pushes harder
+        # on front feet (which are higher on stairs) to maintain height.
+        # This creates a +20 Nm nose-up pitch moment that accelerates
+        # the pitch divergence.  The MPC's pitch penalty is insufficient
+        # to counteract the height-driven force distribution.
+        #
+        # FIX: Make pitch Q DOMINANT over pz Q (2:1 ratio).
+        #   pitch=120, pz=60: the MPC now prioritizes pitch correction
+        #   over height tracking.  This means the body may sag 1-2cm
+        #   during transitions, but pitch stays within ±10° which prevents
+        #   the cascade that leads to rollover.
+        #
+        # ωy=15: very strong pitch-rate damping.  Debug log showed pitch
+        #   rate reaching 10°/s = 0.17 rad/s sustained for >1s.
+        #   At ωy=15, penalty = 15*(0.17)² = 0.44 per tick, providing
+        #   meaningful deceleration of pitch rotation.
+        #
+        # vx=12: robot surged from 0.08 to 0.21 m/s at t=6.15.
+        #   Each step is hit at 2.6× intended speed, giving the MPC
+        #   only 40% of the intended time to regulate per step.
+        #
+        # State order: [φ, θ, ψ, px, py, pz, ωx, ωy, ωz, vx, vy, vz, -g]
+        #
+        # TUNED from third run log analysis (roll failure at t=9.1):
+        #
+        # RC: Roll is the actual kill mode, NOT pitch.  At t=8.83, diagonal
+        #   stance FL(step1)=139N vs RR(flat)=46N creates +9.3 Nm roll torque
+        #   (87 rad/s² → 4°/tick).  With roll Q=35 vs pitch Q=120, the MPC
+        #   sacrificed roll to correct pitch.  Roll diverged to -9.3° in one
+        #   tick, then 30° → crash.
+        #
+        # FIX: roll Q 35→60 — EQUAL priority with pz (both 60).
+        #   The MPC now distributes forces to zero roll torque FIRST, then
+        #   uses remaining authority for pitch.  This prevents the roll
+        #   divergence cascade that caused all 3 previous failures.
+        #
+        # ωx: 1→8 — strong roll-rate damping.  Log showed roll rate hitting
+        #   15°/s (0.26 rad/s) before divergence.  At ωx=8: penalty =
+        #   8*(0.26)² = 0.54 per tick, providing meaningful deceleration.
+        #
+        # vx: 12→25 — robot surged from cmd=0.05 to actual=0.21 m/s (4.2×).
+        #   At vx=25: penalty for 0.16 m/s error = 25*(0.16)² = 0.64,
+        #   comparable to pitch error penalty = 120*(0.14)² = 2.35.
+        #   This prevents the speed surge that leaves <1s per tread.
+        #
+        # FIX: pz 60→100.  In the first successful climb (t=35s, x=2.43),
+        # pitch was 10-14° on the flat approach (x=1.6→2.0).  Root cause:
+        # pz=60 (down from flat-Q 150) gave weak height tracking, letting
+        # the body sag at the front, which pitched up.  At pz=100, height
+        # tracking is 67% of flat-Q strength — strong enough to prevent sag
+        # while still allowing pitch Q=120 to dominate on stairs (1.2:1 ratio).
+        self._stairs_Q = np.array([
+            60., 120.,  1.,     # roll (STRONG — kill mode), pitch, yaw
+             1.,  15., 100.,    # px, py, pz (↑ from 60 — reduce flat pitch)
+             8.,  15.,  1.,     # ωx (roll-rate damp), ωy (pitch-rate damp), ωz
+            25.,  15.,  8.,     # vx (prevent surge), vy, vz
+             0.,                # -g
+        ], dtype=float)
 
         print(f"\n[MPC Controller]  K={K}  dt={mpc_dt*1e3:.0f}ms  "
               f"T_gait={gait_period:.2f}s  duty={duty:.0%}  "
@@ -118,8 +260,11 @@ class Go2MPCController:
         trunk_id = 1   # base_link (from config.py)
         print("MuJoCo trunk mass:", float(self.model.body_mass[trunk_id]))
         print("MuJoCo trunk inertia:", self.model.body_inertia[trunk_id])
+        print(f"  Terrain mode: '{self.terrain.mode}'  "
+              f"swing_cl={self.terrain.swing_clearance():.3f}m  "
+              f"td_z={self.terrain.touchdown_z():.3f}m")
 
-        
+
 
 
     # ── Helper: rotate body-frame commands into world frame ──────────────────
@@ -145,6 +290,10 @@ class Go2MPCController:
         state = self.estimator.update()
         t     = state.t
         pz    = state.pos[2]
+
+        # Update terrain estimate from current stance foot positions.
+        # In flat mode this is a no-op; no behaviour change.
+        self.terrain.update(state)
 
         if t > self._pz_last_t:
             dt_step           = t - self._pz_last_t
@@ -199,6 +348,11 @@ class Go2MPCController:
                 # Do NOT reset to NOMINAL_HEIGHT at Phase C — it causes the
                 # robot to drop during the warmup phase.
                 self.pz_des = float(self._pz_settled)
+                # Store as nominal clearance above terrain.
+                # Subtract terrain_z so the foot geometry offset (~0.022m) cancels:
+                #   target_pz = terrain_z + (pz_settled - terrain_z) = pz_settled  ← flat ground (no drift)
+                #   target_pz = terrain_z_step + (pz_settled - terrain_z_flat)      ← on steps (correct)
+                self._nominal_clearance = float(self._pz_settled) - self.terrain.terrain_z
             print(f"\n[t={t:.2f}s] ── Phase B: ALL-STANCE MPC  "
                   f"(pz_des={self.pz_des:.3f}m, settled={self._pz_settled})")
             self._mpc_active  = True
@@ -232,6 +386,11 @@ class Go2MPCController:
                     # self.pz_des = NOMINAL_HEIGHT  ← REMOVED THIS BUG
 
                     self._pz_integral = 0.0
+                    print(f"  [Phase C CHECK] terrain.mode='{self.terrain.mode}'  "
+                          f"swing_cl={self.terrain.swing_clearance():.3f}m  "
+                          f"td_z={self.terrain.touchdown_z():.3f}m  "
+                          f"terrain_z={self.terrain.terrain_z:.4f}m  "
+                          f"nominal_cl={self._nominal_clearance:.3f}m")
 
                     # Seed _prev_contacts from actual gait phase
                     self._prev_contacts = self.gait.contact_at(t).copy()
@@ -304,6 +463,10 @@ class Go2MPCController:
             if contacts_sched.sum() == 0:
                 contacts_sched = np.ones(4, dtype=bool)
 
+            # Store for logger so plots show true gait schedule, not the
+            # pz-override state.contact (which is always all-True when standing)
+            self._contacts_sched = contacts_sched.copy()
+
             # ── FIX 6 & 7: compute world-frame commands ONCE per step ────────
             # Rotate body-frame cmd_vx/cmd_vy → world frame using current yaw.
             # This is used for Raibert touchdown placement so the foot lands
@@ -352,7 +515,8 @@ class Go2MPCController:
         ctrl_clipped = np.clip(ctrl, -TORQUE_LIMIT, TORQUE_LIMIT)
         self._apply(ctrl_clipped)
         self.logger.log(state, self._grf, ctrl_clipped, self._phase,
-                        self.pz_des, self._trot_active, self._mpc_active)
+                        self.pz_des, self._trot_active, self._mpc_active,
+                        contacts_sched=self._contacts_sched)
         return state
 
     def _apply(self, ctrl: np.ndarray) -> None:
@@ -364,6 +528,7 @@ class Go2MPCController:
         psi = state.euler[2]
         t   = state.t
 
+        # ── Contact schedule ─────────────────────────────────────
         if not self._trot_active:
             schedule = np.ones((self.K, NUM_LEGS), dtype=bool)
         else:
@@ -378,35 +543,194 @@ class Go2MPCController:
                 if schedule.sum() == 0:
                     schedule[:] = True
 
-        cmd  = np.array([self.cmd_vx, self.cmd_vy, self.cmd_wz])
-        Xref = make_reference(x0, cmd, self.pz_des,
-                              self.mpc_dt, self.K, self._pz_integral)
+        # ── Support plane update ─────────────────────────────────
+        if self.terrain.is_flat():
+            support_plane = None
+        else:
+            self.support_plane.update(state.foot_pos, state.contact)
+            support_plane = self.support_plane
 
+        # ── Terrain adaptive references ──────────────────────────
+        pitch_ref = 0.0
+        Q_active  = None
+
+        if not self.terrain.is_flat():
+
+            target_pz = self.terrain.target_pz(
+                state.pos[0], self._nominal_clearance)
+
+            # Rate limiter for pz_des changes.  When the robot crosses a stair
+            # edge, target_pz jumps +3cm (half-riser, since we average front
+            # and rear terrain).  The rate limit prevents force impulses that
+            # couple into pitch/roll.
+            # FIX: increased 3→5 cm/s.  At 3 cm/s, a 3cm half-riser jump
+            # takes 1.0s to track.  Debug log shows pz_err growing to +0.016
+            # at t=7.4 (pz lagging by 16mm), causing the MPC to generate
+            # excessive upward force that couples into pitch oscillation.
+            # At 5 cm/s, the same 3cm jump tracks in 0.6s — fast enough to
+            # prevent lag while still smooth enough to avoid force spikes.
+            # ── FIX B: asymmetric pz_des rate limiter ────────────────────────
+            # BEFORE (too slow ascending → OVERFORCE → roll crash):
+            #   _PZ_RATE = 0.05 m/s = 1.25mm/tick  (up AND down)
+            #   A 30mm riser takes 24 ticks = 600ms → sustained OVERFORCE.
+            #   At t=23.05: pz_des=0.428, pz=0.391 (37mm lag) → cf[FL]=365N
+            #   → roll torque=40Nm → Δroll=4.7°/tick → crash at roll=25°.
+            #
+            # AFTER: separate rates for ascent and descent.
+            #   UP:   0.12 m/s = 3.0mm/tick → 30mm riser in 10 ticks (250ms)
+            #   DOWN: 0.04 m/s = 1.0mm/tick → gentle descent, no sudden drop
+            #   OVERFORCE window: 600ms → 250ms (58% reduction).
+            _PZ_RATE_UP   = 0.12   # m/s — ascending
+            _PZ_RATE_DOWN = 0.04   # m/s — descending
+            pz_error = target_pz - self.pz_des
+            if pz_error > 0:
+                _max_d = _PZ_RATE_UP   * self.mpc_dt
+            else:
+                _max_d = _PZ_RATE_DOWN * self.mpc_dt
+            self.pz_des += float(np.clip(pz_error, -_max_d, _max_d))
+
+            # FIX: pitch_ref IIR α=0.5→0.3 (30% old, 70% new).
+            # With α=0.5, the smoothed pitch_ref lags the geometric slope by
+            # 3-6° for ~75ms after crossing a step edge.  During this lag, the
+            # MPC generates anti-pitch torques (pitch Q=80 × 6°² = large) that
+            # actively push the robot backward, opposing the climb.
+            # α=0.3 settles in ~2 ticks (50ms), reducing the lag to 1-2°.
+            # The geometric pitch_ref from terrain_estimator is deterministic
+            # (not noisy), so aggressive tracking is safe.
+            raw_pitch_ref = self.terrain.pitch_ref(state.pos[0])
+            self._pitch_ref_smooth = (0.3 * self._pitch_ref_smooth
+                                      + 0.7 * raw_pitch_ref)
+            pitch_ref = self._pitch_ref_smooth
+
+            # FIX: Activate _stairs_Q as soon as terrain mode is active — NOT
+            # just when front hip is over stairs (x_body > 1.807).
+            # Root cause of second failure: the robot hits the first step at
+            # x=1.74 while STILL using base Q (py=1, vy=2). The diagonal
+            # stance (FL on step, RR on flat) creates lateral roll torques that
+            # the base Q cannot resist for the ~0.3s before front_hip_x>2.0.
+            # Result: vy grew from 0 to 0.38 m/s in the ~1s before rollover.
+            Q_active = self._stairs_Q
+
+        cmd  = np.array([self.cmd_vx, self.cmd_vy, self.cmd_wz])
+        # FIX 9: pass terrain for per-step pitch_ref and pz_des in horizon.
+        Xref = make_reference(
+            x0, cmd, self.pz_des,
+            self.mpc_dt, self.K,
+            self._pz_integral,
+            pitch_ref=pitch_ref,
+            terrain=self.terrain if not self.terrain.is_flat() else None,
+            nominal_clearance=self._nominal_clearance,
+        )
+
+        # ── Terrain-aware dynamics ───────────────────────────────
         Ad_list, Bd_list = [], []
+
         for k in range(self.K):
-            A_c = self.dyn.Ac(psi)
-            B_c = self.dyn.Bc(state.r_feet, psi, schedule[k])
+            A_c = self.dyn.Ac(psi, support_plane=support_plane)
+
+            B_c = self.dyn.Bc(
+                state.r_feet,
+                psi,
+                schedule[k],
+                support_plane=support_plane
+            )
+
             Ad, Bd = self.dyn.discretise(A_c, B_c, self.mpc_dt)
+
             Ad_list.append(Ad)
             Bd_list.append(Bd)
 
-        Aqp, Bqp  = self.mpc.condense(Ad_list, Bd_list)
-        H, g      = self.mpc.cost(Aqp, Bqp, x0, Xref)
-        C, lb, ub = self.mpc.constraints(schedule)
-        U_opt     = self.mpc.solve(H, g, C, lb, ub)
+        Aqp, Bqp = self.mpc.condense(Ad_list, Bd_list)
 
-        self._grf = U_opt[0:12].reshape(4, 3)
+        H, g = self.mpc.cost(
+            Aqp, Bqp,
+            x0, Xref,
+            Q_override=Q_active
+        )
+
+        C, lb, ub = self.mpc.constraints(
+            schedule,
+            support_plane=support_plane
+        )
+
+        U_opt = self.mpc.solve(H, g, C, lb, ub)
+
         new_grf = U_opt[0:12].reshape(4, 3)
-        # Exponential smoothing (critical for stable trot)
-        beta = 0.6
-        self._grf = beta * new_grf + (1 - beta) * self._grf
+
+        # ── GRF smoothing ────────────────────────────────────────
+        # GRF smoothing: β controls how fast the QP solution is applied.
+        # Flat: β=0.75 (proven stable from flat-ground runs).
+        # Stairs: β=0.65 (was 0.85 → too slow, was 0.50 → too fast).
+        # At β=0.85: stale forces persist 7+ ticks, causing ±50% wr oscillation.
+        # At β=0.50: force changes too fast, causing pitch/roll oscillation.
+        # β=0.65: tracks QP changes in 4 ticks (~100ms), ±30% wr oscillation.
+        beta = 0.75 if self.terrain.is_flat() else 0.65
+
+        if self._trot_active and not np.all(~schedule[0]):
+            n_stance = int(schedule[0].sum())
+            fz_seed  = np.clip(
+                self.p.mass * self.p.g / max(n_stance, 1),
+                self.p.f_min,
+                self.p.f_max
+            )
+            for i in range(NUM_LEGS):
+                # FIX: threshold 0.5→0.7.  On stairs, legs transitioning from
+                # swing carry _grf[i,2]≈0.  With β=0.50 smoothing and seed at
+                # 50%, the first-tick stance force is ~50% of needed (37N vs 75N).
+                # This creates the 100ms underforce window (wr=0.64) visible in
+                # the log at t=7.5.  Seeding at 70% ensures legs start at full
+                # target force immediately, eliminating the underforce spike.
+                if schedule[0, i] and self._grf[i, 2] < fz_seed * 0.7:
+                    self._grf[i] = np.array([0.0, 0.0, fz_seed])
+
+        self._grf = beta * new_grf + (1.0 - beta) * self._grf
 
         if DEBUG_LEVEL >= 3:
             total_fz = self._grf[:, 2].sum()
             weight   = self.p.mass * self.p.g
             if total_fz < 0.5 * weight:
                 dbg(1, f"[WARN t={t:.3f}s] Σfz={total_fz:.1f}N < "
-                       f"0.5·W={0.5*weight:.1f}N — robot may fall")
+                       f"0.5·W={0.5*weight:.1f}N — robot may fall")    
+
+    def switch_to_terrain_mode(self, mode: str = "stairs") -> None:
+        """
+        Activate terrain-aware mode mid-run (e.g. when robot approaches stairs).
+
+        Call this once from the simulation loop when the robot's x-position
+        crosses the stair approach threshold.  At that moment we:
+          1. Switch the terrain estimator from "flat" to the new mode so it
+             begins tracking stance foot z-positions.
+          2. Compute _nominal_clearance from the current settled pz and
+             the current (still ≈ 0) terrain estimate, so that
+               target_pz = terrain_z + _nominal_clearance ≈ pz_des
+             keeps the robot at its current height as the estimator warms up.
+        """
+        if self.terrain.mode == mode:
+            return   # already active
+        self.terrain.set_mode(mode)
+        # BUG FIX (nominal_clearance): use the SETTLED height, not pz_des.
+        # When terrain switches before Phase B is complete (or during Phase A),
+        # pz_des may still be NOMINAL_HEIGHT=0.320 instead of the settled
+        # ~0.338m.  Using pz_des=0.320 sets nominal_clearance=0.320, causing
+        # target_pz = terrain_z + 0.320 = 0.320 on flat ground.  The MPC then
+        # tracks pz_des DOWN from 0.338 to 0.320 throughout Phase B (GRF_ratio
+        # drops to 0.91, confirmed in log).  Use _pz_settled if available
+        # (Phase A/B did converge), otherwise fall back to pz_des.
+        ref_pz = (float(self._pz_settled)
+                  if self._pz_settled is not None and self._pz_settled > COLLAPSE_HEIGHT
+                  else self.pz_des)
+        # Re-anchor clearance to ref_pz so no step change on switch.
+        # BUG FIX: removed +0.02 buffer that pushed pz_des 2cm above settled
+        # height.  On flat ground this forced the MPC to generate extra upward
+        # force during the entire approach, consuming control authority that
+        # should be reserved for stair response.
+        self._nominal_clearance = ref_pz - self.terrain.terrain_z
+        self.pz_des = ref_pz   # ensure pz_des also reflects settled height
+        src = "settled" if (self._pz_settled is not None and self._pz_settled > COLLAPSE_HEIGHT) else "pz_des"
+        print(f"\n[switch_to_terrain_mode] → '{mode}'  "
+              f"pz_des={self.pz_des:.3f}m (from {src})  "
+              f"terrain_z={self.terrain.terrain_z:.3f}m  "
+              f"nominal_clearance={self._nominal_clearance:.3f}m")
 
     @property
     def grf(self) -> np.ndarray:

@@ -25,7 +25,7 @@ XML_PATH = "/home/stanny/unitree_ws/unitree_mujoco/unitree_robots/go2/scene.xml"
 # =============================================================================
 DEBUG_LEVEL = 2
 LOG_CSV     = True
-LOG_FILE    = "mpc_debug_log.csv"
+LOG_FILE    = "data/mpc_debug_log.csv"
 
 
 def dbg(level: int, msg: str) -> None:

@@ -42,7 +42,7 @@ import mujoco
 
 from config import (
     LEG_NAMES, NUM_LEGS, FOOT_BODY_IDS, QVEL_COLS,
-    HIP_ORIGINS, TORQUE_LIMIT, dbg,
+    HIP_ORIGINS, TORQUE_LIMIT, CONTACT_THR, dbg,
 )
 from robot_params import RobotState
 from gait_scheduler import TrotGait
@@ -52,7 +52,7 @@ from gait_scheduler import TrotGait
 KP_SWING = np.diag([400., 400., 400.])
 KD_SWING = np.diag([75., 75., 75.])
 
-HEIGHT_SWING = 0.08   # 8cm clearance (reference uses 0.1m)
+HEIGHT_SWING = 0.08   # 8cm clearance for flat ground (reference uses 0.1m)
 
 
 def _min_jerk(s):
@@ -104,7 +104,8 @@ def raibert_touchdown(state: RobotState,
                       gait: TrotGait,
                       leg_idx: int,
                       cmd_vx_world: float = 0.0,
-                      cmd_vy_world: float = 0.0) -> np.ndarray:
+                      cmd_vy_world: float = 0.0,
+                      p_td_z: float = 0.02) -> np.ndarray:
     """
     Raibert heuristic touchdown position.
 
@@ -130,12 +131,24 @@ def raibert_touchdown(state: RobotState,
     hip_offset_body = HIP_ORIGINS[leg_idx]
     hip_pos_world = state.pos + state.R @ hip_offset_body
 
-    ground_z = 0.02   # slight offset (reference uses 0.02)
-
-    # ── FIX 1: separate nominal drift from error correction ────────────────
+    # ── FIX: separate nominal drift from error correction ────────────────
     # k_v proportional to full gait period (reference values)
-    k_v_x = 0.4 * T   # ≈ 0.08 m·s at T=0.20
-    k_v_y = 0.2 * T   # ≈ 0.04 m·s at T=0.20
+    k_v_x = 0.4 * T   # ≈ 0.12 m·s at T=0.40
+    # FIX (lateral oscillation): k_v_y reduced 0.4*T → 0.15*T.
+    # At 0.4*T the per-step y-correction amplified lateral velocity error each
+    # gait cycle: vy oscillated -0.027 → -0.077 → +0.204 → -0.153 → +0.700 m/s
+    # (explosion at t≈6s, ROLL=11°, robot rolls over before reaching stairs).
+    # Root cause: Raibert feedback gain > 1/(2*pred_time) creates closed-loop
+    # instability in lateral dynamics.  0.15*T ≈ 0.06 gives a correction of
+    # ≈0.02m per 0.1 m/s error — enough to damp drift without amplifying it.
+    # FIX: Reduced k_v_y 0.15*T → 0.05*T.
+    # Analysis of second failure: vy grew from 0.08 to 0.38 m/s over ~1s.
+    # With k_v_y=0.15*T, correction per 0.1 m/s error = 0.15*0.4*0.1 = 6mm/step.
+    # Combined with weak MPC lateral tracking (py=1,vy=2), this is insufficient
+    # to damp vy oscillations — each swing cycle amplifies rather than damps.
+    # At k_v_y=0.05*T: correction = 2mm/step, small enough to be stable while
+    # the MPC (now py=15, vy=15) handles the main lateral regulation.
+    k_v_y = 0.05 * T   # was 0.15*T
 
     # Velocity tracking errors in world frame
     vx_err = state.vel[0] - cmd_vx_world
@@ -144,7 +157,7 @@ def raibert_touchdown(state: RobotState,
     p_td = np.array([
         hip_pos_world[0] + cmd_vx_world * pred_time + k_v_x * vx_err,
         hip_pos_world[1] + cmd_vy_world * pred_time + k_v_y * vy_err,
-        ground_z
+        p_td_z   # flat: 0.02, terrain-aware: terrain_z + small offset
     ])
     # ──────────────────────────────────────────────────────────────────────
 
@@ -157,17 +170,28 @@ class SwingController:
 
     For swing legs: PD + feedforward in Cartesian space with inertia decoupling
     For stance legs: direct Jacobian transpose mapping (handled by torque_utils)
+
+    Parameters
+    ----------
+    terrain : TerrainEstimator or None
+        None  → flat-ground mode: exact original behaviour.
+        Given → terrain-aware: uses terrain.touchdown_z() and
+                terrain.swing_clearance() instead of hardcoded values,
+                and activates early-touchdown detection.
     """
 
     def __init__(self, gait: TrotGait,
-                 model: mujoco.MjModel, data: mujoco.MjData):
-        self.gait  = gait
-        self.model = model
-        self.data  = data
+                 model: mujoco.MjModel, data: mujoco.MjData,
+                 terrain=None):
+        self.gait    = gait
+        self.model   = model
+        self.data    = data
+        self._terrain = terrain   # TerrainEstimator | None
 
-        self._swing_start_t  : dict = {}   # leg_idx → float
-        self._swing_traj     : dict = {}   # leg_idx → callable
-        self._ground_z_est   = 0.02
+        self._swing_start_t    : dict = {}         # leg_idx → float
+        self._swing_traj       : dict = {}         # leg_idx → callable
+        self._ground_z_est     = 0.02
+        self._early_touchdown  = np.zeros(4, dtype=bool)  # per-leg flag
 
     def update_ground_estimate(self, state: RobotState) -> None:
         stance_z = [
@@ -194,21 +218,41 @@ class SwingController:
         cmd_vx_world  : desired x-velocity in WORLD frame [m/s]  ← NEW
         cmd_vy_world  : desired y-velocity in WORLD frame [m/s]  ← NEW
         """
-        self._swing_start_t[leg_idx] = t
+        self._swing_start_t[leg_idx]   = t
+        self._early_touchdown[leg_idx] = False   # reset on every new swing
+
+        terrain = self._terrain
+        stairs  = terrain is not None and not terrain.is_flat()
+        h_sw    = terrain.swing_clearance() if terrain else HEIGHT_SWING
 
         if state is not None:
-            # FIX 1 applied here — pass world-frame commands to Raibert
+            # Compute Raibert touchdown (p_td_z placeholder; overridden for stairs)
             p_td = raibert_touchdown(state, self.gait, leg_idx,
-                                     cmd_vx_world, cmd_vy_world)
+                                     cmd_vx_world, cmd_vy_world,
+                                     p_td_z=0.02)
+            if stairs:
+                # ── Stair-aware foot placement ───────────────────────────
+                # 1. Snap x to safe zone within the step tread
+                p_td[0] = terrain.snap_to_tread(p_td[0])
+                # 2. Set z from the deterministic height map at the
+                #    snapped x (surface_z + foot_radius)
+                p_td[2] = terrain.foot_touchdown_z(p_td[0])
+            else:
+                # Flat mode: global touchdown z (backward-compatible)
+                p_td[2] = terrain.touchdown_z() if terrain else self._ground_z_est
         else:
             p_td = foot_pos_world.copy()
-            p_td[2] = self._ground_z_est
+            if stairs:
+                p_td[2] = terrain.foot_touchdown_z(p_td[0])
+            else:
+                p_td[2] = terrain.touchdown_z() if terrain else self._ground_z_est
 
         self._swing_traj[leg_idx] = make_swing_trajectory(
-            foot_pos_world, p_td, self.gait.swing_time, HEIGHT_SWING
+            foot_pos_world, p_td, self.gait.swing_time, h_sw
         )
         dbg(2, f"Leg {LEG_NAMES[leg_idx]} LIFT-OFF t={t:.3f}s "
-               f"foot={foot_pos_world.round(3)} td={p_td.round(3)}")
+               f"foot={foot_pos_world.round(3)} td={p_td.round(3)}"
+               + (" [stair-snap]" if stairs else ""))
 
     def compute_torques(self, state: RobotState,
                         contacts: np.ndarray) -> np.ndarray:
@@ -226,6 +270,8 @@ class SwingController:
 
         for i, leg in enumerate(LEG_NAMES):
             if contacts[i]:
+                # Stance leg from gait schedule — reset early touchdown flag
+                self._early_touchdown[i] = False
                 continue   # stance — handled by grf_to_joint_torques
 
             bid  = FOOT_BODY_IDS[leg]
@@ -240,14 +286,49 @@ class SwingController:
             mujoco.mj_jac(self.model, self.data, jacp, jacr, p_cur, bid)
 
             # ── FIX 2: full foot velocity (body + leg DOFs) ───────────────
-            # BEFORE: Ji = jacp[:, cols]; v_foot = Ji @ state.dq[i*3:i*3+3]
-            #   → ignores body translational & angular velocity
-            # AFTER:  use all 18 DOFs via the full (3×nv) Jacobian
             v_foot = jacp @ self.data.qvel[:nv]
             # ─────────────────────────────────────────────────────────────
 
             # 3×3 leg sub-Jacobian (still needed for tau mapping)
             Ji = jacp[:, cols]   # (3, 3)
+
+            # ── Early touchdown detection (terrain-aware, non-flat mode only) ─
+            # If the gait says swing but the foot has physical contact, the
+            # foot hit a step earlier than scheduled.  Freeze the leg in place
+            # (velocity damping + gravity comp) rather than continuing to push
+            # it into the terrain trying to reach the planned touchdown point.
+            #
+            # GUARD 1: skip entirely in flat mode.
+            #   Even though _terrain is set, in flat mode early-touchdown is
+            #   never needed and causes false triggers from buffer bleed.
+            #
+            # GUARD 2: minimum 60% swing progress.
+            #   The 10-step rolling-max cf buffer retains high stance values
+            #   for ~20 ms after lift-off.  A 25ms grace period was insufficient
+            #   because feet hitting the stair RISER FACE at 20-30% swing progress
+            #   would freeze far short of the safe tread zone (e.g. FL at x=2.006
+            #   instead of the intended x=2.04).  Requiring 60% swing ensures the
+            #   foot has cleared the riser and is descending toward the tread before
+            #   early touchdown can fire.
+            if (self._terrain is not None and not self._terrain.is_flat()
+                    and not self._early_touchdown[i]):
+                time_since_liftoff = t - self._swing_start_t.get(i, t)
+                swing_progress = time_since_liftoff / max(self.gait.swing_time, 1e-6)
+                if state.cf[i] > CONTACT_THR and swing_progress > 0.60:
+                    self._early_touchdown[i] = True
+                    dbg(2, f"Leg {leg} EARLY TOUCHDOWN "
+                           f"t={t:.3f}s  z={p_cur[2]:.3f}m  "
+                           f"swing={swing_progress:.0%}")
+
+            if self._early_touchdown[i]:
+                # Hold foot: damp velocity only, plus gravity compensation.
+                # Zero position error prevents pushing foot into the surface.
+                F_task = KD_SWING @ (-v_foot)
+                tau[i*3 : i*3+3] = Ji.T @ F_task + self.data.qfrc_bias[cols]
+                dbg(4, f"Swing {leg}: EARLY-TD hold  "
+                       f"|F|={np.linalg.norm(F_task):.1f}N")
+                continue
+            # ─────────────────────────────────────────────────────────────
 
             # Desired foot state from trajectory
             t_start = self._swing_start_t.get(i, t)

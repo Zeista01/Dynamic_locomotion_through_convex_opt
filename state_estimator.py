@@ -70,6 +70,23 @@ class StateEstimator:
         self._cf_buf = np.zeros((10, 4))
         self._cf_idx = 0
 
+        # ── Build geom→leg map dynamically from the loaded model ─────────────
+        # config.py has hardcoded FOOT_GEOM_IDS that were tuned for a specific
+        # scene.  Different scenes (stairs vs flat) shift all robot geom IDs by
+        # the number of worldbody geoms added before the robot.  Looking up IDs
+        # by NAME at runtime is scene-agnostic and always correct.
+        self._geom_to_leg: dict = {}
+        leg_geom_names = {"FL": 0, "FR": 1, "RL": 2, "RR": 3}
+        for gname, leg_idx in leg_geom_names.items():
+            gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, gname)
+            if gid >= 0:
+                self._geom_to_leg[gid] = leg_idx
+            else:
+                print(f"[WARN StateEstimator] geom '{gname}' not found in model")
+        print(f"[StateEstimator] foot geom IDs: "
+              + ", ".join(f"{n}={list(self._geom_to_leg.keys())[i]}"
+                          for i, n in enumerate(leg_geom_names)))
+
         self._verify_ids()
 
     # ── Startup check ──────────────────────────────────────────────────────────
@@ -160,10 +177,14 @@ class StateEstimator:
           • Forcing contacts=True when standing is always the right behaviour.
         """
         # ── Step 1: accumulate raw contact forces ─────────────────────────────
+        # Use self._geom_to_leg (built dynamically from the model) instead of
+        # the hardcoded config.GEOM_TO_LEG, which has wrong IDs when scene
+        # geoms shift robot geom numbering (e.g. stairs scene adds 6 geoms).
         cf_raw = np.zeros(4)
+        gmap   = self._geom_to_leg
         for ci in range(d.ncon):
             c   = d.contact[ci]
-            idx = GEOM_TO_LEG.get(c.geom1, GEOM_TO_LEG.get(c.geom2, -1))
+            idx = gmap.get(c.geom1, gmap.get(c.geom2, -1))
             if idx < 0:
                 continue
             addr = c.efc_address

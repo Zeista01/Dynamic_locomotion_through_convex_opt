@@ -1,0 +1,300 @@
+================================================================================
+QUADRUPED ROBOT TROT DEBUGGING ANALYSIS
+CSV FILE: /home/stanny/Dynamic_locomotion_through_convex_opt/cvx_opt/mpc_debug_log.csv
+Analysis Date: 2026-02-20
+================================================================================
+
+EXECUTIVE SUMMARY
+================================================================================
+The quadruped robot SUCCESSFULLY executes a trotting gait during Phase C (flat ground)
+with correct diagonal leg alternation, but FAILS due to HEIGHT LOSS and WEIGHT 
+OVERLOAD caused by UNDERPOWERED STANCE LEGS.
+
+The robot DOES NOT fail because the trotting pattern is broken. It fails because
+the MPC controller cannot generate sufficient vertical ground reaction force during
+swing phases to maintain body height.
+
+
+1. PHASE TRANSITIONS
+================================================================================
+Phase A_PD (Settle):      t=0.000s → t=1.500s (duration: 1.50s)
+  - Robot settling to standing posture
+  - All 4 legs in contact
+  - pz: 0.4450m → 0.3382m (dropped 0.1068m)
+  
+Phase B (Climb Setup):    t=1.500s → t=3.502s (duration: 2.00s)
+  - Preparing for stairs
+  - All 4 legs in contact (static stance)
+  - pz: 0.3382m → 0.3394m (stable, Δ=+0.0012m)
+  
+Phase C (Trot on Flat):   t=3.502s → t=8.000s (duration: 4.50s)
+  - Dynamic trotting gait
+  - Diagonal leg alternation (FL+RR, then FR+RL, repeat)
+  - pz: 0.3394m → 0.3069m (dropped 0.0325m over 4.5s)
+
+
+2. TROT PATTERN ANALYSIS
+================================================================================
+STATUS: ✓ WORKING CORRECTLY (mechanically)
+
+Phase C shows perfect diagonal alternation:
+  - FL+RR stance phase: Contact forces FL=70-220N, RR=50-235N, FR≈0N, RL≈0N
+  - FR+RL stance phase: Contact forces FR=65-210N, RL=55-210N, FL≈0N, RR≈0N
+  - Transitions smooth every ~0.05s (20Hz frequency)
+
+Initial transient (t=3.50-3.85s): All 4 legs briefly in contact (settling into gait)
+Steady trot (t=3.85-8.00s): Perfect diagonal alternation maintained
+
+VERDICT: The trot mechanism is NOT the problem. Leg lifting works correctly.
+
+
+3. HEIGHT TRAJECTORY ANALYSIS
+================================================================================
+Phase A_PD:  Range 0.3382m to 0.4464m (Δ=0.1082m)
+             Settling behavior - expected
+             
+Phase B:     Range 0.3382m to 0.3394m (Δ=0.0012m)
+             Stable standing - excellent
+             
+Phase C:     Range 0.2973m to 0.3396m (Δ=0.0423m)
+             EXCESSIVE OSCILLATION - indicates control instability
+
+Trajectory detail in Phase C:
+  t=3.50s: pz=0.3394m (start of trot)
+  t=4.00s: pz=0.3230m (dropped 0.0164m)
+  t=5.00s: pz=0.3087m (dropped 0.0143m)
+  t=6.00s: pz=0.3070m (dropped 0.0017m, minimum approach)
+  t=6.20s: pz=0.2973m (LOWEST POINT)
+  t=8.00s: pz=0.3069m (recovered slightly)
+
+HEIGHT LOSS PATTERN: Progressive sinking during trot execution
+  - Loss rate: ~0.007m per second
+  - Total loss over 4.5s: 0.0325m (3.25cm)
+  - This is CRITICAL for stair climbing (needs clearance!)
+
+FAILURE THRESHOLD CROSSED: t=5.390s (pz < 0.30m)
+  Duration below 0.30m: 0.85s (from t=5.39s to t=6.24s)
+
+
+4. CONTACT FORCE & GRF ANALYSIS
+================================================================================
+
+Contact Forces (cf_XX) show diagonal alternation:
+  Typical FL+RR stance: CF_FL=90N, CF_RR=100N, CF_FR=0N, CF_RL=0N
+  Typical FR+RL stance: CF_FR=100N, CF_RL=100N, CF_FL=0N, CF_RR=0N
+
+Ground Reaction Forces (fz_XX) should match contact forces:
+  Phase C range: 1.76N to 111.27N per leg
+  Total GRF: 147-191N (should be ≈149N = body weight consistently)
+
+WEIGHT RATIO (total_fz / weight):
+  Expected: 0.8-1.2 (1.0 = perfect equilibrium)
+  Phase C actual: 0.96-1.47
+  Mean: 1.13 (acceptable but variable)
+  
+  CRITICAL SPIKE: weight_ratio reaches 1.38 at t=5.39s
+  - Coincides exactly with pz dropping below 0.30m
+  - Indicates one stance pair over-loaded during swing transition
+  - Sign of insufficient leg force capacity
+
+
+5. FORWARD VELOCITY ANALYSIS
+================================================================================
+Phase C velocity (vx):
+  Range: -0.0739m/s to 0.3382m/s
+  Mean: 0.1245m/s
+  Characteristic: NOISY and OSCILLATORY
+
+Velocity pattern:
+  t=3.50s: vx ≈ -0.0006m/s (near zero, settling)
+  t=4.50s: vx ≈ +0.1519m/s (accelerating)
+  t=5.50s: vx ≈ +0.0994m/s (decelerating)
+  t=6.00s: vx ≈ +0.2139m/s (accelerating again)
+  t=8.00s: vx ≈ +0.2649m/s (final)
+
+OSCILLATION AMPLITUDE: ±0.1m/s around 0.12m/s mean
+  This is normal for trotting gait (velocity varies with stance/swing)
+  
+VERDICT: Velocity control is reasonable but not smooth
+
+
+6. PITCH (BODY ATTITUDE) ANALYSIS
+================================================================================
+Phase C pitch trajectory:
+  Start: pitch=-0.54° (slight nose-down)
+  t=4.50s: pitch=+1.67°
+  t=5.50s: pitch=+3.54°
+  t=6.48s: pitch=+6.94° (MAXIMUM)
+  t=8.00s: pitch=+5.34°
+
+PITCH GROWTH RATE: +1.78°/s in Phase C (over 4.5s)
+
+INTERPRETATION:
+  Pitch is growing (nose rising), which is UNUSUAL for a robot sinking.
+  Possible causes:
+    1. Front legs hitting ground harder than hind legs
+    2. Body center-of-mass rotating during swing transitions
+    3. Feedback control trying to maintain height by rotating
+    4. Hip actuators compensating for low vertical force
+
+VERDICT: Pitch growth suggests body is pitching up while sinking.
+         This indicates asymmetric contact forces or timing mismatch.
+
+
+7. FAILURE POINT ANALYSIS
+================================================================================
+
+TIME OF FAILURE: t=5.3900s
+FAILURE CRITERION: pz < 0.30m (below ground clearance threshold)
+
+Context at failure:
+  Phase: C (trotting)
+  Stance: FR+RL (front and hind-right legs lifting)
+  pz: 0.2999m (0.0001m below threshold!)
+  pitch: +1.60°
+  vx: 0.1397m/s (DECELERATING)
+  weight_ratio: 1.38 (OVERLOADED)
+  
+  Contact forces:
+    FL: 5.8N (swing leg, correctly off ground)
+    FR: 119.7N (stance leg, correct)
+    RL: 76.7N (stance leg, correct)
+    RR: 3.5N (swing leg, correctly off ground)
+
+ROOT CAUSE: During FR+RL stance phase, the robot cannot generate enough
+            vertical force from front legs (FR) and hind-right leg (RL) to 
+            support the full body weight. Result:
+              • Body sinks (pz drops)
+              • Weight concentrates on fewer legs (ratio > 1.2)
+              • Contact forces spike to compensate
+              • Hip pitches up to maintain stability
+
+This is the classic signature of UNDERPOWERED STANCE LEGS.
+
+
+8. DETAILED FAILURE PROGRESSION (t=5.30s to t=5.50s)
+================================================================================
+Time(s) | Phase | pz(m)  | dpz/dt | pitch° | vx(m/s) | CF_FL | CF_FR | CF_RL | CF_RR | Stance
+5.2900  | C     | 0.3141 | -0.050 |  1.88  |  0.1561 |   90  |    0  |    0  |   53  | FL+RR
+5.3300  | C     | 0.3121 | -0.252 |  1.97  |  0.1799 |    9  |    0  |    0  |    8  | TRANS (critical!)
+5.3700  | C     | 0.3020 | -0.055 |  1.49  |  0.1535 |    0  |  187  |  191  |    0  | FR+RL
+5.4100  | C     | 0.2998 | +0.107 |  1.96  |  0.1252 |    0  |  120  |   73  |    0  | FR+RL
+5.4500  | C     | 0.3041 | +0.120 |  3.02  |  0.0870 |    0  |  102  |   54  |    0  | FR+RL
+5.4900  | C     | 0.3089 | -0.002 |  3.56  |  0.0914 |    0  |   91  |   58  |    0  | FR+RL
+
+Key event at t=5.3300s (TRANSITION POINT):
+  - All 4 legs briefly unload (cf_XX all near 0)
+  - Largest vertical velocity drop: dpz/dt = -0.252m/s
+  - Height plummets from 0.3141m to 0.3020m in 0.04s
+  - This is where the robot's ballistic trajectory cannot be recovered
+
+After transition:
+  - Robot lands on FR+RL pair with pz=0.3020m
+  - Cannot lift back to 0.31m during swing phase
+  - Gradually loses more height per cycle
+
+
+9. KEY DIAGNOSTICS
+================================================================================
+
+CHECK #1: Contact Forces (cf_XX) - Is trot working?
+  Result: ✓ YES - Perfect diagonal alternation, no simultaneous all-legs-down
+
+CHECK #2: Height Maintenance (pz) - Is body staying up?
+  Result: ✗ NO - Drops 3.3cm during 4.5s trot, reaches minimum 0.297m
+
+CHECK #3: Weight Ratio - Is loading balanced?
+  Result: ⚠ MARGINAL - Mean 1.13, spikes to 1.38 (exceeds 1.2 limit)
+
+CHECK #4: Forward Velocity (vx) - Is robot moving?
+  Result: ✓ ACCEPTABLE - Accelerates to 0.27m/s, oscillates ±0.1m/s
+
+CHECK #5: Pitch Stability - Is body rotating excessively?
+  Result: ⚠ CONCERNING - Grows at 1.78°/s, reaches 6.94° (unusual for sinking)
+
+CHECK #6: GRF Distribution - Are forces balanced?
+  Result: ⚠ MARGINAL - Varies 147-191N, some asymmetry visible
+
+
+10. ROOT CAUSE HYPOTHESIS
+================================================================================
+
+The robot fails not because the trot pattern is broken, but because:
+
+UNDERPOWERED STANCE LEGS
+  During each swing phase, the two stance legs must support 100% of body weight.
+  The MPC controller cannot generate sufficient vertical force from these legs.
+  
+Symptoms:
+  1. Body sinks progressively (pz drops 3.3cm over 4.5s)
+  2. Weight ratio spikes during transitions (>1.2)
+  3. GRF varies significantly (147-191N) indicating unstable control
+  4. Pitch grows as controller compensates
+  5. Failure occurs precisely at swing transitions (t=5.39s)
+
+Contributing Factors:
+  1. Low leg spring stiffness (if using springs)
+  2. Low PD gains in swing leg controller
+  3. Insufficient feed-forward forces in MPC
+  4. Ground compliance too stiff (harsh impacts)
+  5. Timing mismatch (legs hitting ground before ready)
+  6. Contact model not accounting for impact damping
+
+
+11. RECOMMENDATIONS FOR FIXING
+================================================================================
+
+IMMEDIATE FIXES (Software):
+  1. Increase vertical force tracking gains in MPC
+  2. Add swing leg height constraint (z_swing > z_min)
+  3. Implement soft contact model with damping
+  4. Reduce trot frequency (increase stance phase duration)
+  5. Add pz_des reference trajectory (avoid step changes)
+
+MEDIUM-TERM FIXES (Model/Config):
+  1. Verify leg spring constants in robot_params.py
+  2. Check PD controller gains for swing legs
+  3. Review MPC weight matrices (cost function)
+  4. Examine gait phase timing in gait_scheduler.py
+  5. Validate contact model in dynamics.py
+
+DIAGNOSTIC STEPS:
+  1. Plot leg trajectory (x,y,z positions in world frame)
+  2. Check ground impact detection and handling
+  3. Verify swing leg clearance is sufficient (>0.05m)
+  4. Analyze leg joint torques to detect saturation
+  5. Test with reduced body weight (simulation only)
+
+FILES TO EXAMINE:
+  - /home/stanny/Dynamic_locomotion_through_convex_opt/cvx_opt/mpc_controller.py
+  - /home/stanny/Dynamic_locomotion_through_convex_opt/cvx_opt/swing_controller.py
+  - /home/stanny/Dynamic_locomotion_through_convex_opt/cvx_opt/robot_params.py
+  - /home/stanny/Dynamic_locomotion_through_convex_opt/cvx_opt/gait_scheduler.py
+  - /home/stanny/Dynamic_locomotion_through_convex_opt/cvx_opt/dynamics.py
+
+
+12. DATA SUMMARY TABLE (0.5s intervals)
+================================================================================
+t(s)  | Phase | pz(m)  | pitch° | vx(m/s) | CF_FL | CF_FR | CF_RL | CF_RR | w_ratio
+------|-------|--------|--------|---------|-------|-------|-------|-------|--------
+0.000 | A_PD  | 0.4450 |  0.00  |  0.0000 | 156.5 | 156.5 |  99.6 |  99.6 |  1.00
+0.500 | A_PD  | 0.3397 | -0.54  |  0.0144 |  34.8 |  34.8 |  41.2 |  41.2 |  1.00
+1.000 | A_PD  | 0.3384 | -0.47  |  0.0007 |  34.4 |  34.4 |  40.2 |  40.2 |  1.00
+1.500 | B     | 0.3382 | -0.46  |  0.0002 |  34.3 |  34.3 |  40.3 |  40.3 |  1.01
+2.000 | B     | 0.3386 | -0.48  | -0.0006 |  34.1 |  34.1 |  40.5 |  40.5 |  1.02
+2.500 | B     | 0.3389 | -0.50  | -0.0006 |  34.1 |  34.1 |  40.5 |  40.5 |  1.02
+3.000 | B     | 0.3391 | -0.52  | -0.0006 |  34.1 |  34.1 |  40.5 |  40.5 |  1.02
+3.500 | B     | 0.3394 | -0.54  | -0.0006 |  34.1 |  34.1 |  40.5 |  40.5 |  1.01
+4.000 | C     | 0.3230 | -0.69  |  0.0045 |  90.4 |   0.0 |   0.0 |  99.4 |  1.22
+4.500 | C     | 0.3132 |  1.67  |  0.1519 |  87.3 |   0.0 |   0.0 |  58.1 |  0.98
+5.000 | C     | 0.3087 |  1.05  |  0.0288 |   0.0 |  79.9 |  91.1 |   0.0 |  1.15
+5.500 | C     | 0.3096 |  3.54  |  0.0994 |   0.0 |  86.8 |  58.5 |   0.0 |  0.99
+6.000 | C     | 0.3070 |  3.57  |  0.2139 | 113.7 |   0.0 |   0.0 |  80.3 |  1.25
+6.500 | C     | 0.3165 |  6.80  |  0.1715 |  66.0 |   0.0 |   0.0 |  79.0 |  1.00
+7.000 | C     | 0.3070 |  4.89  |  0.2217 |   0.0 |  94.5 |  73.0 |   0.0 |  1.18
+7.500 | C     | 0.3167 |  6.40  |  0.0838 |   0.0 |  67.2 |  78.3 |   0.0 |  1.00
+8.000 | C     | 0.3069 |  5.34  |  0.2649 | 120.2 |   0.0 |   0.0 |  80.4 |  1.27
+
+================================================================================
+END OF REPORT
+================================================================================

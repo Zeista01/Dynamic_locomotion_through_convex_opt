@@ -3,3 +3,5 @@ __pycache__/
 *.csv
 results_1/
 results_2/
+claude.md/
+backup/

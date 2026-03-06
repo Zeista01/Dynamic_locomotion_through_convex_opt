@@ -1,0 +1,1719 @@
+\documentclass[12pt,a4paper]{report}
+
+% ── Packages ──────────────────────────────────────────────────────────────────
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{bm}           % bold math
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{longtable}
+\usepackage{multirow}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{float}
+\usepackage{enumitem}
+\usepackage{titlesec}
+\usepackage{fancyhdr}
+\usepackage{tikz}
+\usetikzlibrary{shapes,arrows,positioning,fit,backgrounds}
+
+% ── Hyperref setup ────────────────────────────────────────────────────────────
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue!60!black,
+    urlcolor=blue!60!black,
+    citecolor=green!50!black,
+}
+
+% ── Header / footer ───────────────────────────────────────────────────────────
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\nouppercase{\leftmark}}
+\fancyhead[R]{\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+
+% ── Code listing style ────────────────────────────────────────────────────────
+\lstset{
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{blue!70!black}\bfseries,
+  commentstyle=\color{green!50!black}\itshape,
+  stringstyle=\color{red!60!black},
+  numberstyle=\tiny\color{gray},
+  numbers=left,
+  frame=single,
+  breaklines=true,
+  showstringspaces=false,
+  tabsize=4,
+}
+
+% ── Math helpers ──────────────────────────────────────────────────────────────
+\newcommand{\vect}[1]{\bm{#1}}
+\newcommand{\mat}[1]{\mathbf{#1}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\skew}[1]{[#1]_{\times}}
+\DeclareMathOperator{\diag}{diag}
+\DeclareMathOperator*{\argmin}{arg\,min}
+
+% ── Title ─────────────────────────────────────────────────────────────────────
+\title{
+    \vspace{-1cm}
+    {\Large\textbf{Dynamic Locomotion through Convex Optimisation}}\\[0.8em]
+    {\large Complete Technical Documentation}\\[0.4em]
+    {\normalsize Convex MPC Trot Controller for the Unitree Go2 Quadruped Robot}\\[0.3em]
+    {\normalsize Flat-Ground Trotting $\cdot$ Stair Ascent \& Descent $\cdot$ Terrain Adaptation}\\[1em]
+    {\small Based on: Di Carlo et al., ``Dynamic Locomotion in the MIT Cheetah 3\\
+    Through Convex Model-Predictive Control'', IROS 2018}
+}
+\author{Stanny}
+\date{\today}
+
+% ══════════════════════════════════════════════════════════════════════════════
+\begin{document}
+% ══════════════════════════════════════════════════════════════════════════════
+
+\maketitle
+\tableofcontents
+\listoftables
+\newpage
+
+% ══════════════════════════════════════════════════════════════════════════════
+\chapter{Introduction and Project Overview}
+% ══════════════════════════════════════════════════════════════════════════════
+
+\section{Motivation}
+
+Legged robots must balance three competing requirements simultaneously: they must
+generate sufficient ground-reaction forces (GRFs) to support their weight,
+satisfy friction constraints at each foot, and coordinate leg swing trajectories
+that advance the body forward.  Classical approaches couple these problems,
+making real-time control difficult.
+
+This project implements the approach of Di~Carlo et al.\ \cite{diCarlo2018},
+which decouples stance-force optimisation from swing-foot placement by
+formulating the stance problem as a \emph{convex} Quadratic Programme (QP)
+that can be solved on a $30\,\mathrm{ms}$ horizon in real time.
+
+\section{Platform}
+
+\textbf{Hardware:} Unitree Go2 quadruped robot.\\
+\textbf{Simulation:} MuJoCo 3.x (via the \texttt{unitree\_mujoco} scene).\\
+\textbf{Solver:} \texttt{quadprog} (primary) / \texttt{osqp} (fallback).
+
+\section{Feature Summary}
+
+\begin{itemize}[noitemsep]
+    \item Flat-ground diagonal trot at commanded forward velocity.
+    \item Stair ascent and descent over a 5-step staircase
+          ($6\,\mathrm{cm}$ riser, $28\,\mathrm{cm}$ tread, $30\,\mathrm{cm}$ total height).
+    \item Adaptive CoM height, body pitch reference, and swing clearance.
+    \item Terrain-aware friction-cone constraints via support-plane estimation.
+    \item Per-foot stair tread snapping and early-touchdown detection.
+    \item Collapse detection and PD recovery mode.
+\end{itemize}
+
+\section{Repository Structure}
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+\textbf{File} & \textbf{Role} \\
+\midrule
+\texttt{robot\_params.py}     & Physical parameters, Q weights, RobotState dataclass \\
+\texttt{config.py}            & MuJoCo IDs, hardware limits, debug flags \\
+\texttt{dynamics.py}          & SRB A/B matrices, ZOH discretisation \\
+\texttt{gait\_scheduler.py}   & Trot gait contact schedule \\
+\texttt{state\_estimator.py}  & Ground-truth reader, contact detection \\
+\texttt{mpc\_solver.py}       & Condensed QP: condense, cost, constraints, solve \\
+\texttt{swing\_controller.py} & Minimum-jerk swing trajectory, task-space PD \\
+\texttt{torque\_utils.py}     & GRF$\to$torques, reference builder, PD stand, logger \\
+\texttt{terrain\_estimator.py}& Stair geometry, IIR terrain tracking \\
+\texttt{support\_plane.py}    & SVD plane fit of stance feet \\
+\texttt{mpc\_controller.py}   & Phase A/B/C state machine (top-level) \\
+\texttt{simulation.py}        & MuJoCo viewer + headless runner \\
+\texttt{flat\_trot.py}        & Entry point — flat ground \\
+\texttt{stairs\_climb.py}     & Entry point — stair scene \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ══════════════════════════════════════════════════════════════════════════════
+\chapter{Robot Model and Physical Parameters}
+% ══════════════════════════════════════════════════════════════════════════════
+
+\section{Go2 Physical Parameters}
+
+The Unitree Go2 is modelled as a \emph{Single Rigid Body} (SRB) at the
+centroidal level.  Only the trunk mass and inertia enter the MPC; leg masses
+(approx.\ $1.5\,\mathrm{kg}$/leg) are compensated by adding the joint-space
+gravity/Coriolis bias $\vect{q}_{\text{frc\_bias}}$ after the QP solve.
+
+\begin{table}[H]
+\centering
+\caption{Go2 physical parameters used in the MPC}
+\begin{tabular}{lll}
+\toprule
+\textbf{Parameter} & \textbf{Symbol} & \textbf{Value} \\
+\midrule
+Total mass            & $m$      & $15.206\,\mathrm{kg}$ \\
+Gravity               & $g$      & $9.81\,\mathrm{m/s^2}$ \\
+Roll inertia (body)   & $I_{xx}$ & $0.10703\,\mathrm{kg\,m^2}$ \\
+Pitch inertia (body)  & $I_{yy}$ & $0.09808\,\mathrm{kg\,m^2}$ \\
+Yaw inertia (body)    & $I_{zz}$ & $0.02445\,\mathrm{kg\,m^2}$ \\
+Hip ab/ad offset      & $l_\mathrm{hip}$   & $0.08085\,\mathrm{m}$ \\
+Thigh link length     & $l_\mathrm{thigh}$ & $0.213\,\mathrm{m}$ \\
+Calf link length      & $l_\mathrm{calf}$  & $0.213\,\mathrm{m}$ \\
+\midrule
+Hip origin FL (body frame) & & $(+0.1934,\,+0.1125,\,0)$ \\
+Hip origin FR (body frame) & & $(+0.1934,\,-0.1125,\,0)$ \\
+Hip origin RL (body frame) & & $(-0.1934,\,+0.1125,\,0)$ \\
+Hip origin RR (body frame) & & $(-0.1934,\,-0.1125,\,0)$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Body-Frame Inertia Tensor}
+
+\begin{equation}
+    \mat{I}_B = \diag\!\left(I_{xx},\; I_{yy},\; I_{zz}\right)
+              = \diag(0.1070,\; 0.0981,\; 0.0245)\;\mathrm{kg\,m^2}
+\end{equation}
+
+\section{MPC State Vector}
+
+The 13-dimensional state vector used throughout the MPC is:
+
+\begin{equation}
+    \vect{x} = \begin{bmatrix}
+        \phi & \theta & \psi & p_x & p_y & p_z &
+        \omega_x & \omega_y & \omega_z & v_x & v_y & v_z & {-g}
+    \end{bmatrix}^\top \in \R^{13}
+    \label{eq:state}
+\end{equation}
+
+\begin{table}[H]
+\centering
+\caption{MPC state vector components}
+\begin{tabular}{cllll}
+\toprule
+\textbf{Index} & \textbf{Symbol} & \textbf{Meaning} & \textbf{Unit} & \textbf{Frame} \\
+\midrule
+0  & $\phi$     & Roll  (Euler ZYX)      & rad    & World \\
+1  & $\theta$   & Pitch (Euler ZYX)      & rad    & World \\
+2  & $\psi$     & Yaw   (Euler ZYX)      & rad    & World \\
+3  & $p_x$      & CoM position $x$       & m      & World \\
+4  & $p_y$      & CoM position $y$       & m      & World \\
+5  & $p_z$      & CoM position $z$       & m      & World \\
+6  & $\omega_x$ & Angular velocity $x$   & rad/s  & World \\
+7  & $\omega_y$ & Angular velocity $y$   & rad/s  & World \\
+8  & $\omega_z$ & Angular velocity $z$   & rad/s  & World \\
+9  & $v_x$      & Linear velocity $x$    & m/s    & World \\
+10 & $v_y$      & Linear velocity $y$    & m/s    & World \\
+11 & $v_z$      & Linear velocity $z$    & m/s    & World \\
+12 & $-g$       & Gravity augmentation   & m/s$^2$ & — \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The \emph{gravity augmentation} trick appends the constant $-g$ as the 13th
+state so that gravity appears naturally in the linear dynamics via the
+$\mat{A}$ matrix without needing an affine term.
+
+% ══════════════════════════════════════════════════════════════════════════════
+\chapter{Single Rigid Body Dynamics}
+% ══════════════════════════════════════════════════════════════════════════════
+
+\section{Centroidal Model Motivation}
+
+A quadruped with $4 \times 3 = 12$ leg joints has 18 degrees of freedom
+(6 body + 12 joints).  Real-time whole-body optimisation over a predictive
+horizon is intractable.  The \emph{single rigid body} (SRB) model reduces the
+problem to 13 states and $4\times 3 = 12$ inputs (one 3-D force vector per
+foot), giving a convex QP solvable in $<5\,\mathrm{ms}$.
+
+The SRB assumptions are:
+\begin{enumerate}[noitemsep]
+  \item Leg masses are small compared to the trunk ($\approx 10\%$ each).
+  \item Foot accelerations are small (slow enough swings).
+  \item The inertia tensor can be approximated by rotating the body-frame
+        tensor by yaw only (Di~Carlo approximation).
+\end{enumerate}
+
+\section{Newton--Euler Equations}
+
+For a rigid body with $n_c$ foot contacts, Newton's second law gives:
+
+\begin{align}
+    m\,\dot{\vect{v}} &= \sum_{i=1}^{n_c} \vect{f}_i + m\,\vect{g}
+    \label{eq:newton} \\[4pt]
+    \hat{\mat{I}}\,\dot{\vect{\omega}} &=
+        \sum_{i=1}^{n_c} \vect{r}_i \times \vect{f}_i
+    \label{eq:euler}
+\end{align}
+
+where $\vect{f}_i \in \R^3$ is the ground-reaction force (GRF) at foot $i$,
+$\vect{r}_i = \vect{p}_i - \vect{p}_\mathrm{CoM}$ is the moment arm from the
+CoM to foot $i$, and $\hat{\mat{I}}$ is the world-frame inertia tensor.
+
+\subsection{Di Carlo Inertia Approximation}
+
+Computing the full world-frame inertia $\mat{R}\,\mat{I}_B\,\mat{R}^\top$
+at every time step introduces trilinear products that destroy convexity.
+Di~Carlo et al.\ approximate this by rotating only around yaw:
+
+\begin{equation}
+    \hat{\mat{I}}(\psi) = \mat{R}_z(\psi)\;\mat{I}_B\;\mat{R}_z(\psi)^\top
+    \label{eq:inertia_approx}
+\end{equation}
+
+where $\mat{R}_z(\psi)$ is the rotation matrix for yaw angle $\psi$.
+This is exact on flat ground when roll and pitch are small, which is a
+reasonable approximation during trotting locomotion.
+
+\section{Continuous-Time State-Space Model}
+
+\subsection{Euler-Angle Kinematics}
+
+Using the small-angle Euler-rate approximation from Eq.~(12) of Di~Carlo:
+
+\begin{equation}
+    \begin{bmatrix}\dot\phi \\ \dot\theta \\ \dot\psi\end{bmatrix}
+    \approx \mat{R}_z(\psi)^\top\;\vect{\omega}
+\end{equation}
+
+This gives the upper-left block of $\mat{A}_c$:
+\begin{equation}
+    \mat{A}_c[0\!:\!3,\; 6\!:\!9] = \mat{R}_z(\psi)^\top
+\end{equation}
+
+\subsection{Position Kinematics}
+
+Linear velocity integrates directly into position:
+\begin{equation}
+    \mat{A}_c[3\!:\!6,\; 9\!:\!12] = \mat{I}_3
+\end{equation}
+
+\subsection{Gravity Augmentation}
+
+The 13th state $x_{12} = -g$ feeds into $\dot v_z$:
+\begin{equation}
+    \mat{A}_c[11,\; 12] = 1
+    \quad\Longrightarrow\quad
+    \dot v_z \supseteq x_{12} = -g
+\end{equation}
+
+\subsection{Full Continuous A Matrix}
+
+\begin{equation}
+    \mat{A}_c(\psi) =
+    \begin{pmatrix}
+        \mat{0}_{3\times3} & \mat{0}_{3\times3} & \mat{R}_z(\psi)^\top & \mat{0}_{3\times3} & \mat{0}_{3\times1} \\
+        \mat{0}_{3\times3} & \mat{0}_{3\times3} & \mat{0}_{3\times3} & \mat{I}_3 & \mat{0}_{3\times1} \\
+        \mat{0}_{3\times3} & \mat{0}_{3\times3} & \mat{0}_{3\times3} & \mat{0}_{3\times3} & \mat{0}_{3\times1} \\
+        \mat{0}_{3\times3} & \mat{0}_{3\times3} & \mat{0}_{3\times3} & \mat{0}_{3\times3} & \vect{e}_3 \\
+        \mat{0}_{1\times3} & \mat{0}_{1\times3} & \mat{0}_{1\times3} & \mat{0}_{1\times3} & 0
+    \end{pmatrix}
+    \in \R^{13\times13}
+    \label{eq:Ac}
+\end{equation}
+
+where $\vect{e}_3 = [0,0,1]^\top$ places the gravity constant in the $v_z$ equation.
+
+\subsection{Continuous B Matrix}
+
+The $\mat{B}_c$ matrix maps the control input
+$\vect{u} = [\vect{f}_1^\top, \vect{f}_2^\top, \vect{f}_3^\top, \vect{f}_4^\top]^\top \in \R^{12}$
+to state derivatives.  For each stance foot $i$ ($c_i = 1$):
+
+\begin{equation}
+    \mat{B}_c[6\!:\!9,\; 3i\!:\!3(i+1)] = \hat{\mat{I}}^{-1}\,\skew{\vect{r}_i}
+    \qquad\text{(angular dynamics)}
+    \label{eq:Bc_ang}
+\end{equation}
+
+\begin{equation}
+    \mat{B}_c[9\!:\!12,\; 3i\!:\!3(i+1)] = \frac{\mat{I}_3}{m}
+    \qquad\text{(linear dynamics)}
+    \label{eq:Bc_lin}
+\end{equation}
+
+where $\skew{\vect{r}}$ denotes the $3\times3$ skew-symmetric matrix
+(cross-product operator) of vector $\vect{r}$:
+
+\begin{equation}
+    \skew{\vect{r}} =
+    \begin{pmatrix}
+        0 & -r_z & r_y \\
+        r_z & 0 & -r_x \\
+        -r_y & r_x & 0
+    \end{pmatrix}
+\end{equation}
+
+Swing legs ($c_i = 0$) contribute zero columns to $\mat{B}_c$.
+If all contacts are zero (fallback), all feet are treated as stance.
+
+\textbf{Critical sign convention:} The GRF $\vect{f}_i$ is the force the
+\emph{ground exerts on the foot} (positive $z$ = upward).  The skew
+cross-product $\vect{r}_i \times \vect{f}_i$ already has the correct sign for
+Newton-Euler Eq.~\eqref{eq:euler}.
+
+\textbf{Frame convention:} Moment arms $\vect{r}_i$ are kept in the
+\emph{world frame}.  The $\mat{B}$ matrix maps world-frame forces to
+world-frame accelerations; mixing frames (e.g.\ rotating $\vect{r}$ into the
+support plane while $\vect{f}$ remains in world frame) produces a physically
+wrong cross product.  The support-plane rotation is used \emph{only} in the
+friction-cone constraints.
+
+\section{Zero-Order Hold Discretisation}
+
+Given the continuous pair $(\mat{A}_c, \mat{B}_c)$ and a timestep $\Delta t$,
+the ZOH discrete matrices are obtained from the matrix exponential:
+
+\begin{equation}
+    \begin{pmatrix}\mat{A}_d \\ \mat{B}_d\end{pmatrix}
+    = \exp\!\left(
+        \begin{pmatrix} \mat{A}_c & \mat{B}_c \\ \mat{0} & \mat{0} \end{pmatrix}
+        \Delta t
+    \right)_{:n_s,\,:}
+    \label{eq:zoh}
+\end{equation}
+
+In practice, we form the $(n_s + n_u)\times(n_s + n_u)$ matrix
+$\mat{M} = [\mat{A}_c, \mat{B}_c;\, \mat{0}, \mat{0}]\,\Delta t$,
+compute $e^{\mat{M}}$ via \texttt{scipy.linalg.expm}, and read off:
+\begin{equation}
+    \mat{A}_d = e^{\mat{M}}[0\!:\!n_s,\; 0\!:\!n_s], \qquad
+    \mat{B}_d = e^{\mat{M}}[0\!:\!n_s,\; n_s\!:]
+\end{equation}
+
+This is re-computed at \emph{every} MPC solve, because $\mat{B}_c$ changes
+with foot positions and the contact schedule, making the system
+\emph{time-varying} over the horizon.
+
+% ══════════════════════════════════════════════════════════════════════════════
+\chapter{Trot Gait Scheduler}
+% ══════════════════════════════════════════════════════════════════════════════
+
+\section{Diagonal Trot Pattern}
+
+A trot gait alternates two \emph{diagonal pairs}:
+\begin{itemize}[noitemsep]
+  \item Pair 1: FL (front-left) + RR (rear-right)
+  \item Pair 2: FR (front-right) + RL (rear-left)
+\end{itemize}
+
+\noindent\textbf{Parameters:}
+\begin{align*}
+    T &= 0.40\,\text{s}  \quad &&\text{(full gait cycle period, 2.5 Hz)}\\
+    d &= 0.50            \quad &&\text{(duty cycle: 50\% stance, 50\% swing)}\\
+    T_\text{stance} &= 0.20\,\text{s}, \quad T_\text{swing} = 0.20\,\text{s}
+\end{align*}
+
+\section{Phase Computation}
+
+The phase offsets for each leg are:
+\begin{equation}
+    \text{offset} = [0.0,\; 0.5,\; 0.5,\; 0.0]
+    \quad\text{for FL, FR, RL, RR respectively}
+\end{equation}
+
+Phase of leg $i$ at simulation time $t$:
+\begin{equation}
+    \phi_i(t) = \left(\frac{t - t_0}{T} + \mathrm{offset}_i\right) \bmod 1
+    \label{eq:gait_phase}
+\end{equation}
+
+where $t_0$ is the gait \emph{activation time} (time when Phase C begins).
+Leg $i$ is in stance when $\phi_i < d$, swing otherwise.
+
+\textbf{Why relative phase matters (Bug Fix):}  If $t_0 = 0$ and the
+simulation has been running for $t = 4.5\,\text{s}$, the phase
+$4.5/0.4 = 11.25 \Rightarrow \phi = 0.25$ places the robot mid-cycle, causing
+the first swing step to be incorrectly timed.  By anchoring to $t_0$ at
+activation time, the gait always starts cleanly at $\phi = 0$.
+
+\section{Horizon Schedule}
+
+For the MPC, a $(K\times4)$ boolean schedule matrix is precomputed:
+
+\begin{equation}
+    \mat{S}[k, i] = \mathbf{1}\!\left[\phi_i(t_0^{\text{mpc}} + k\,\Delta t) < d\right]
+    \quad k=0,\ldots,K-1
+\end{equation}
+
+where $t_0^{\text{mpc}}$ is the current simulation time at each MPC call.
+
+% ══════════════════════════════════════════════════════════════════════════════
+\chapter{State Estimation}
+% ══════════════════════════════════════════════════════════════════════════════
+
+\section{Ground-Truth Extraction}
+
+Since this is a simulation-based controller, the state estimator reads
+ground-truth values directly from MuJoCo data buffers every physics step
+($2\,\text{ms}$ at $500\,\text{Hz}$):
+
+\begin{itemize}[noitemsep]
+  \item $\vect{p} = \texttt{d.qpos}[0\!:\!3]$ — CoM position.
+  \item $\hat{\vect{q}} = \texttt{d.qpos}[3\!:\!7]$ (wxyz) — body quaternion,
+        converted to rotation matrix $\mat{R}$ and Euler angles
+        $[\phi, \theta, \psi]$ via ZYX convention.
+  \item $\vect{v} = \texttt{d.qvel}[0\!:\!3]$ — CoM linear velocity (world).
+  \item $\vect{\omega} = \texttt{d.qvel}[3\!:\!6]$ — angular velocity (world).
+  \item Joint positions $\vect{q}$ and velocities $\dot{\vect{q}}$ read from
+        their respective qpos/qvel slices.
+  \item Foot world positions from \texttt{d.xpos[FOOT\_BODY\_IDS[leg]]}.
+\end{itemize}
+
+\section{Contact Detection Strategy}
+
+\subsection{Raw efc\_force Reading}
+
+MuJoCo reports constraint forces via \texttt{d.efc\_force[addr]}.  For each
+active contact, the geom IDs are checked against a runtime-built map
+(constructed from \texttt{mj\_name2id} lookups), and the force is accumulated
+per leg:
+
+\begin{equation}
+    c_{f,i}^{\text{raw}} = \sum_{\text{contacts with foot }i}
+    \left|\texttt{efc\_force}[\texttt{addr}]\right|
+\end{equation}
+
+\subsection{Rolling-Maximum Buffer}
+
+A 10-step ($20\,\text{ms}$) rolling-maximum buffer suppresses single-step
+dropouts:
+\begin{equation}
+    c_{f,i} = \max_{j \in \{0,\ldots,9\}}\; c_{f,i}^{\text{raw}}[t - j\,\Delta t_\text{phys}]
+\end{equation}
+
+\subsection{Height-Based Override (Critical Fix)}
+
+MuJoCo's contact solver re-initialises its warm-start when the actuator
+command vector changes abruptly, causing \texttt{efc\_force} to drop to
+\emph{exactly zero} for up to $300\,\text{ms}$ even when all feet are
+physically on the ground.  A rolling buffer of any practical size cannot
+bridge this.
+
+The correct fix uses the body height $p_z$ as a proxy:
+
+\begin{equation}
+    \text{contact}_i =
+    \begin{cases}
+        \texttt{True}  & \text{if } p_z > p_{z,\text{collapse}} = 0.20\,\text{m} \\
+        c_{f,i} > \tau_\text{cf} & \text{otherwise}
+    \end{cases}
+    \label{eq:contact_override}
+\end{equation}
+
+with $\tau_\text{cf} = 10\,\text{N}$.  When $p_z > 0.20\,\text{m}$ the robot
+is clearly standing; forcing all contacts true is always correct because:
+\begin{enumerate}[noitemsep]
+  \item Phase B uses all-stance regardless of contact state.
+  \item Phase C uses the \emph{gait scheduler} for contact decisions,
+        not this estimator.
+  \item Collapse detection uses $p_z$ itself, so a false ``not in contact''
+        cannot trigger it.
+\end{enumerate}
+
+% ══════════════════════════════════════════════════════════════════════════════
+\chapter{Condensed Convex QP Formulation}
+% ══════════════════════════════════════════════════════════════════════════════
+
+\section{Prediction Horizon}
+
+With MPC timestep $\Delta t_\text{mpc} = 30\,\text{ms}$ and horizon $K = 10$
+steps, the controller looks $300\,\text{ms}$ ahead at each solve.
+
+\section{Condensed Dynamics}
+
+Define the stacked state trajectory $\mat{X} \in \R^{Kn_s}$ and stacked input
+trajectory $\mat{U} \in \R^{Kn_u}$.  The time-varying discrete system
+$\vect{x}_{k+1} = \mat{A}_k\vect{x}_k + \mat{B}_k\vect{u}_k$ gives the
+\emph{condensed} form:
+
+\begin{equation}
+    \mat{X} = \mat{A}_{\mathrm{qp}}\,\vect{x}_0 + \mat{B}_{\mathrm{qp}}\,\mat{U}
+    \label{eq:condensed}
+\end{equation}
+
+\subsection{Aqp Matrix}
+
+$\mat{A}_{\mathrm{qp}} \in \R^{Kn_s \times n_s}$ stacks the state-transition
+products:
+
+\begin{equation}
+    \mat{A}_{\mathrm{qp}} =
+    \begin{pmatrix}
+        \mat{A}_0 \\
+        \mat{A}_1 \mat{A}_0 \\
+        \vdots \\
+        \mat{A}_{K-1}\cdots\mat{A}_0
+    \end{pmatrix}
+    \quad\text{where}\quad
+    \Phi_k = \prod_{j=0}^{k}\mat{A}_j
+\end{equation}
+
+\subsection{Bqp Matrix}
+
+$\mat{B}_{\mathrm{qp}} \in \R^{Kn_s \times Kn_u}$ is lower-block-triangular
+(causal):
+
+\begin{equation}
+    \mat{B}_{\mathrm{qp}}[r,c] =
+    \begin{cases}
+        \Phi_{r,c}\,\mat{B}_c & \text{if } r \geq c \\
+        \mat{0} & \text{otherwise}
+    \end{cases}
+    \quad\text{where}\quad
+    \Phi_{r,c} = \prod_{j=c+1}^{r}\mat{A}_j
+\end{equation}
+
+\section{Cost Function}
+
+\subsection{State Tracking}
+
+Define the diagonal weight matrix $\mat{L} = \mat{I}_K \otimes \diag(\vect{q})$
+where $\vect{q} \in \R^{13}$ are the state weights.  The state tracking cost is:
+
+\begin{equation}
+    J_\text{state} = \|\mat{X} - \mat{X}_\text{ref}\|^2_{\mat{L}}
+    = (\mat{A}_{\mathrm{qp}}\vect{x}_0 + \mat{B}_{\mathrm{qp}}\mat{U} - \mat{X}_\text{ref})^\top
+      \mat{L}
+      (\mat{A}_{\mathrm{qp}}\vect{x}_0 + \mat{B}_{\mathrm{qp}}\mat{U} - \mat{X}_\text{ref})
+\end{equation}
+
+\subsection{Force Regularisation}
+
+To prevent unrealistically large forces and ensure uniqueness when multiple
+solutions exist:
+
+\begin{equation}
+    J_\text{force} = \alpha\,\|\mat{U}\|^2_2, \qquad \alpha = 3\times10^{-4}
+\end{equation}
+
+\subsection{Full QP}
+
+\begin{equation}
+    \min_{\mat{U}}\quad \frac{1}{2}\,\mat{U}^\top\mat{H}\,\mat{U} + \vect{g}^\top\mat{U}
+    \label{eq:qp_cost}
+\end{equation}
+
+\begin{align}
+    \mat{H} &= 2\left(\mat{B}_{\mathrm{qp}}^\top\mat{L}\,\mat{B}_{\mathrm{qp}}
+               + \alpha\,\mat{I}_{Kn_u}\right) \\
+    \vect{g} &= 2\,\mat{B}_{\mathrm{qp}}^\top\mat{L}
+               \left(\mat{A}_{\mathrm{qp}}\,\vect{x}_0 - \mat{X}_\text{ref}\right)
+\end{align}
+
+\section{MPC Cost Weights}
+
+\subsection{Flat-Ground Weights}
+
+\begin{equation}
+    \vect{q}_\text{flat} = \diag(10,\; 20,\; 1,\;\; 1,\; 1,\; 150,\;\; 1,\; 5,\; 1,\;\; 2,\; 2,\; 5,\;\; 0)
+\end{equation}
+
+\begin{center}
+for $[\phi, \theta, \psi,\; p_x, p_y, p_z,\; \omega_x, \omega_y, \omega_z,\; v_x, v_y, v_z,\; {-g}]$
+\end{center}
+
+The high $p_z = 150$ strongly penalises height deviation, keeping the CoM at
+the settled height.  The pitch weight $\theta = 20$ prevents forward/backward
+tipping during trot.
+
+\subsection{Stair-Climbing Weights}
+
+\begin{equation}
+    \vect{q}_\text{stairs} = \diag(60,\; 120,\; 1,\;\; 1,\; 15,\; 100,\;\; 8,\; 15,\; 1,\;\; 25,\; 15,\; 8,\;\; 0)
+\end{equation}
+
+The rationale for each change from the flat weights:
+
+\begin{table}[H]
+\centering
+\caption{Stair Q-weight tuning rationale (4 iterations of log analysis)}
+\begin{tabular}{p{1cm}p{2cm}p{2.5cm}p{7cm}}
+\toprule
+\textbf{State} & \textbf{Flat} & \textbf{Stairs} & \textbf{Rationale} \\
+\midrule
+$\phi$ (roll)   & 10  & 60  & Roll is the primary failure mode. Diagonal stance (FL on step, RR on flat) creates $\approx$9.3\,Nm roll torque. Equal priority with $p_z$. \\
+$\theta$ (pitch)& 20  & 120 & Pitch diverges on stairs. Weight \emph{dominant} over $p_z$ (2:1) prevents height-tracking force from creating nose-up moment. \\
+$p_y$           & 1   & 15  & Zero lateral authority caused $v_y$ to explode to 0.38\,m/s on first step. Strong lateral position tracking required. \\
+$p_z$           & 150 & 100 & Reduced from flat (height tracking slightly sacrificed for pitch priority). Still 67\% of flat strength. \\
+$\omega_x$      & 1   & 8   & Roll rate reached 15$^\circ$/s before divergence; strong damping needed. \\
+$\omega_y$      & 5   & 15  & Pitch rate reached 10$^\circ$/s sustained; penalty 15$\times$0.17$^2$=0.44 provides meaningful deceleration. \\
+$v_x$           & 2   & 25  & Robot surged 0.05$\to$0.21\,m/s (4$\times$ overspeed), leaving $<$1\,s per tread. Strong forward-speed regulation. \\
+$v_y$           & 2   & 15  & Lateral velocity regulation to complement $p_y$ tracking. \\
+$v_z$           & 5   & 8   & Vertical velocity oscillation ($\pm$0.15\,m/s) couples into pitch. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Friction Cone Constraints}
+
+\subsection{Physical Constraint}
+
+The foot can only push, not pull, and must stay within the friction cone:
+\begin{equation}
+    f_{n,i} \geq 0, \qquad \sqrt{f_{t,i}^2} \leq \mu\,f_{n,i}
+\end{equation}
+
+where $f_{n,i}$ is the normal force and $f_{t,i}$ is the tangential force,
+$\mu = 0.7$ is the friction coefficient.
+
+\subsection{Linearised Pyramid Approximation}
+
+The circular cone is replaced by a square pyramid (4 planes):
+\begin{align}
+    f_{n,i} &\geq f_\text{min} = 5\,\text{N}
+    \quad\text{(positive normal, min support force)} \\
+    f_{n,i} &\leq f_\text{max} = 200\,\text{N}
+    \quad\text{(leg load limit)} \\
+    f_{t_x,i} - \mu\,f_{n,i} &\leq 0 \label{eq:fc1} \\
+    -f_{t_x,i} - \mu\,f_{n,i} &\leq 0 \label{eq:fc2} \\
+    f_{t_y,i} - \mu\,f_{n,i} &\leq 0 \label{eq:fc3} \\
+    -f_{t_y,i} - \mu\,f_{n,i} &\leq 0 \label{eq:fc4}
+\end{align}
+
+Equations~\eqref{eq:fc1}--\eqref{eq:fc4} give 5 constraints per stance leg
+($1$ normal bound $+$ 4 tangential planes).
+
+\subsection{Terrain-Aware Rotation}
+
+On sloped terrain (stairs), the support-plane normal $\hat{\vect{n}}$ deviates
+from $[0,0,1]^\top$.  The friction cone is rotated into the support frame:
+
+\begin{equation}
+    \vect{f}_\text{plane} = \mat{R}_\text{plane}^\top\,\vect{f}_\text{world}
+\end{equation}
+
+where $\mat{R}_\text{plane}$ is the orthonormal basis of the support plane
+(columns: $\hat{\vect{x}}_\text{plane}$, $\hat{\vect{y}}_\text{plane}$,
+$\hat{\vect{n}}$).  The normal constraint then becomes:
+
+\begin{equation}
+    \hat{\vect{n}}^\top \vect{f}_i \in [f_\text{min},\; f_\text{max}]
+\end{equation}
+
+and the tangential constraints read:
+\begin{equation}
+    \hat{\vect{t}}_{x/y}^\top \vect{f}_i - \mu\,\hat{\vect{n}}^\top \vect{f}_i \leq 0
+\end{equation}
+
+\subsection{Swing-Leg Constraints}
+
+For each swing leg $i$ ($S[k,i] = 0$), all three force components are zeroed:
+\begin{equation}
+    f_{x,i} = f_{y,i} = f_{z,i} = 0 \quad\text{(swing, 3 equality constraints)}
+\end{equation}
+
+% ══════════════════════════════════════════════════════════════════════════════
+\chapter{Reference Trajectory Construction}
+% ══════════════════════════════════════════════════════════════════════════════
+
+\section{Operator Commands}
+
+The operator specifies body-frame commands:
+\begin{equation}
+    \vect{c} = [v_x^\text{cmd},\; v_y^\text{cmd},\; \omega_z^\text{cmd}]
+\end{equation}
+
+\section{Per-Step Reference}
+
+For each horizon step $k$ at projected position $x_k = p_x + v_x^\text{cmd}\,k\,\Delta t$:
+
+\begin{equation}
+    \vect{r}_k =
+    \begin{pmatrix}
+        0                          \\ % roll
+        \theta_\text{ref}          \\ % pitch
+        \psi_0 + \omega_z^\text{cmd}\,k\,\Delta t \\ % yaw
+        x_k                        \\ % px
+        p_y + v_y^\text{cmd}\,k\,\Delta t \\ % py
+        p_{z,\text{des}}^{(k)}     \\ % pz
+        0                          \\ % ωx
+        0                          \\ % ωy
+        \omega_z^\text{cmd}        \\ % ωz
+        v_x^\text{cmd}             \\ % vx
+        v_y^\text{cmd}             \\ % vy
+        0                          \\ % vz
+        -g                         % gravity augmentation
+    \end{pmatrix}
+    \label{eq:Xref}
+\end{equation}
+
+\section{Terrain-Aware Reference (Stairs)}
+
+When terrain mode is active, both $\theta_\text{ref}$ and $p_{z,\text{des}}$
+are computed as a \emph{delta from the current projected position}:
+
+\begin{align}
+    \theta_\text{ref}^{(k)} &= \theta_\text{ref,smooth} + \Delta\theta(x_k) \\
+    \Delta\theta(x_k)       &= \texttt{pitch\_ref}(x_k) - \texttt{pitch\_ref}(x_0)
+\end{align}
+
+\begin{align}
+    p_{z,\text{des}}^{(k)} &= p_{z,\text{des,smooth}} + \Delta p_z(x_k) \\
+    \Delta p_z(x_k) &= \texttt{target\_pz}(x_k, \ell) - \texttt{target\_pz}(x_0, \ell)
+\end{align}
+
+where $\ell$ is the nominal CoM clearance above terrain.  This delta
+formulation preserves the IIR-smoothed current values at $k=0$ while
+anticipating terrain changes in future horizon steps.
+
+\section{Height Integral Correction}
+
+A small integral correction prevents steady-state height error:
+\begin{equation}
+    p_{z,\text{corrected}} = p_{z,\text{des}} + \text{clip}\!\left(0.1\,e_{z,\text{int}},\;-0.05,\;0.05\right)
+\end{equation}
+
+% ══════════════════════════════════════════════════════════════════════════════
+\chapter{Swing Leg Controller}
+% ══════════════════════════════════════════════════════════════════════════════
+
+\section{Minimum-Jerk Trajectory}
+
+The swing trajectory interpolates from the lift-off position $\vect{p}_0$
+to the touchdown position $\vect{p}_f$ using a \emph{minimum-jerk} polynomial:
+
+\begin{equation}
+    s(t) = \frac{t - t_\text{liftoff}}{T_\text{swing}}, \quad s \in [0, 1]
+\end{equation}
+
+\begin{equation}
+    P_\text{mj}(s) = 10s^3 - 15s^4 + 6s^5
+    \label{eq:minjerk}
+\end{equation}
+
+The position trajectory is:
+\begin{equation}
+    \vect{p}_\text{des}(s) = \vect{p}_0 + (\vect{p}_f - \vect{p}_0)\,P_\text{mj}(s)
+                             + z_\text{bump}(s)\,\hat{\vect{e}}_z
+\end{equation}
+
+\subsection{Height Bump}
+
+A smooth height bump ensures foot clearance above the terrain:
+
+\begin{equation}
+    z_\text{bump}(s) = h_\text{sw}\cdot 64\,s^3(1-s)^3
+    \label{eq:heightbump}
+\end{equation}
+
+Properties:
+\begin{itemize}[noitemsep]
+  \item $z_\text{bump}(0) = z_\text{bump}(1) = 0$ (no displacement at endpoints).
+  \item Peak at $s = 0.5$: $z_\text{bump}(0.5) = h_\text{sw}$.
+  \item $\dot{z}_\text{bump}(0) = \dot{z}_\text{bump}(1) = 0$ (smooth lift/land).
+\end{itemize}
+
+For flat ground: $h_\text{sw} = 0.08\,\text{m}$.  On stairs: $h_\text{sw}$
+is terrain-adaptive (see Chapter~\ref{ch:stairs}).
+
+\subsection{Velocity and Acceleration}
+
+\begin{align}
+    \dot{P}_\text{mj}(s) &= 30s^2 - 60s^3 + 30s^4 \\
+    \ddot{P}_\text{mj}(s) &= 60s - 180s^2 + 120s^3
+\end{align}
+
+Foot velocity: $\vect{v}_\text{des} = (\vect{p}_f - \vect{p}_0)\,\dot{P}_\text{mj}/T_\text{swing}$
+
+\section{Raibert Touchdown Heuristic}
+
+The foot touchdown position is determined by the Raibert heuristic
+\cite{raibert1986}:
+
+\begin{equation}
+    \vect{p}_\text{td} = \vect{p}_\text{hip} +
+    \underbrace{\vect{v}_\text{cmd}\,t_\text{pred}}_{\text{nominal drift}} +
+    \underbrace{k_v\,(\vect{v}_\text{actual} - \vect{v}_\text{cmd})}_{\text{error correction}}
+    \label{eq:raibert}
+\end{equation}
+
+where:
+\begin{align}
+    t_\text{pred} &= \frac{T}{2} = \frac{T_\text{swing} + 0.5\,T_\text{stance}}{2}
+    \approx 0.20\,\text{s} \\
+    k_{v,x} &= 0.4\,T \approx 0.12\,\text{m\,s} \\
+    k_{v,y} &= 0.05\,T \approx 0.02\,\text{m\,s}  \quad\text{(reduced to prevent lateral instability)}
+\end{align}
+
+\textbf{Command frame:} The commanded velocity is in the body frame.  It is
+rotated to the world frame before applying the Raibert formula:
+\begin{equation}
+    \begin{pmatrix}v_x^w \\ v_y^w\end{pmatrix} =
+    \begin{pmatrix}\cos\psi & -\sin\psi \\ \sin\psi & \cos\psi\end{pmatrix}
+    \begin{pmatrix}v_x^\text{cmd} \\ v_y^\text{cmd}\end{pmatrix}
+\end{equation}
+
+\textbf{Overcorrection fix:} The original implementation used
+$\vect{p}_\text{td} = \vect{p}_\text{hip} + \vect{v}_\text{actual}\,(t_\text{pred} + k_v)$,
+which applies $(t_\text{pred} + k_v)\,v_\text{actual}$ as one block.  At a
+$0.51\,\text{m/s}$ lateral drift with $k_v = 0.08$, this gives a 3.5$\times$
+larger correction than intended.  The corrected formulation separates nominal
+drift (proportional to \emph{commanded} velocity) from error correction
+(proportional to velocity \emph{error}).
+
+\section{Task-Space PD Controller}
+
+For each swing leg, the joint torques are computed as:
+
+\begin{equation}
+    \vect{\tau}_\text{swing} = \mat{J}_i^\top \underbrace{\left[
+        \mat{K}_p\,(\vect{p}_\text{des} - \vect{p}_\text{cur}) +
+        \mat{K}_d\,(\vect{v}_\text{des} - \vect{v}_\text{cur})
+    \right]}_{\vect{F}_\text{task}} + \vect{\tau}_\text{bias}
+    \label{eq:swing_pd}
+\end{equation}
+
+where:
+\begin{align}
+    \mat{K}_p &= \diag(400, 400, 400)\,\text{N/m} \\
+    \mat{K}_d &= \diag(75, 75, 75)\,\text{N\,s/m} \\
+    \mat{J}_i &= \text{3×3 foot Jacobian (leg DOFs)} \\
+    \vect{\tau}_\text{bias} &= \texttt{qfrc\_bias}[\text{leg joints}]
+    \quad\text{(gravity/Coriolis compensation)}
+\end{align}
+
+\textbf{Foot velocity:} The full foot velocity uses the complete
+$(3\times n_v)$ Jacobian (body + all leg DOFs):
+\begin{equation}
+    \vect{v}_\text{cur} = \mat{J}_\text{full}\;\dot{\vect{q}}_\text{full}
+\end{equation}
+This includes body translational/angular velocity, which is significant when
+the body is rolling or pitching.
+
+\section{GRF to Joint Torques (Stance)}
+
+For stance legs, the MPC ground-reaction forces are converted to joint torques:
+
+\begin{equation}
+    \vect{\tau}_\text{stance,i} = -\mat{J}_i^\top\;\vect{f}_i + \vect{\tau}_\text{bias,i}
+    \label{eq:stance_tau}
+\end{equation}
+
+\textbf{Sign convention (critical):} The MPC gives $\vect{f}_i$ as the force
+the \emph{ground exerts on the foot} (upward positive).  To generate this
+upward reaction, the joint must push \emph{down} against the ground.
+For a knee joint with $J_z < 0$ at nominal stance, $-\mat{J}^\top\vect{f}$
+gives extension torque (pushing down), which is physically correct.
+
+\section{Actuator Reordering}
+
+MuJoCo's actuator order for the Go2 differs from the internal leg ordering:
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+\textbf{Internal order} & \textbf{Indices} & \textbf{MuJoCo ctrl indices} \\
+\midrule
+FL & 0--2  & ctrl[3--5] \\
+FR & 3--5  & ctrl[0--2] \\
+RL & 6--8  & ctrl[9--11] \\
+RR & 9--11 & ctrl[6--8] \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The \texttt{leg\_to\_ctrl()} function performs this remapping before writing
+to \texttt{data.ctrl}.
+
+% ══════════════════════════════════════════════════════════════════════════════
+\chapter{Controller State Machine}
+% ══════════════════════════════════════════════════════════════════════════════
+
+\section{Three-Phase Architecture}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=3.5cm,
+    state/.style={rectangle, rounded corners, draw, fill=blue!10,
+                  minimum width=3cm, minimum height=1.2cm, align=center},
+    arrow/.style={->, thick}
+]
+\node[state] (A) {Phase A\\PD Stand\\$0\!-\!1.5\,\text{s}$};
+\node[state, right=of A] (B) {Phase B\\All-stance MPC\\$1.5\!-\!3.5\,\text{s}$};
+\node[state, right=of B] (C) {Phase C\\Trot MPC\\$t > 3.5\,\text{s}$};
+\node[state, below=1.5cm of B, fill=red!10] (R) {Recovery\\PD Stand\\2\,s};
+
+\draw[arrow] (A) -- node[above, font=\small]{$t > 1.5\,\text{s}$} (B);
+\draw[arrow] (B) -- node[above, font=\small]{$t > 3.5\,\text{s}$, $p_z\geq0.30\,\text{m}$} (C);
+\draw[arrow] (C) to[bend left] node[right, font=\small]{$p_z < 0.20\,\text{m}$} (R);
+\draw[arrow] (R) to[bend left] node[left, font=\small]{$+2\,\text{s}$} (B);
+\end{tikzpicture}
+\caption{MPC controller three-phase state machine}
+\end{figure}
+
+\section{Phase A: PD Settling ($0$--$1.5\,\text{s}$)}
+
+\subsection{Goal}
+Bring the robot from its initial (possibly sprawled) configuration to a
+nominal standing posture with stable contact on all four feet.
+
+\subsection{Controller}
+A joint-space PD controller tracks nominal standing angles:
+
+\begin{equation}
+    \vect{\tau}_\text{PD} = \mat{K}_P\,(\vect{q}_\text{des} - \vect{q}) -
+    \mat{K}_D\,\dot{\vect{q}}
+\end{equation}
+
+with $\vect{q}_\text{des} = [0, 0.7, -1.4]$ rad per leg and
+$\mat{K}_P = \mat{K}_D = \diag(80, 80, 80)\,\text{N\,m/rad}$,
+$\mat{K}_D = \diag(8, 8, 8)\,\text{N\,m\,s/rad}$.
+
+\subsection{Height Estimation}
+During the last $0.8\,\text{s}$ of Phase A, an IIR filter tracks the settled
+CoM height:
+\begin{equation}
+    p_{z,\text{settled}} \leftarrow 0.98\,p_{z,\text{settled}} + 0.02\,p_z
+\end{equation}
+This settled height ($\approx 0.338\,\text{m}$) is used as $p_{z,\text{des}}$
+for all subsequent phases.
+
+\section{Phase B: All-Stance MPC ($1.5$--$3.5\,\text{s}$)}
+
+\subsection{Goal}
+Smoothly transition from PD joint-space control to GRF-based force control
+while maintaining full 4-foot contact.  This ``warm-starts'' the MPC with
+a tractable (all-stance) problem before introducing the complexity of leg swing.
+
+\subsection{Contact Schedule}
+All 4 feet in stance for the full horizon:
+\begin{equation}
+    \mat{S}[k, i] = 1 \quad \forall k, i
+\end{equation}
+
+\subsection{GRF Initialisation}
+Seeded at the static equilibrium:
+\begin{equation}
+    f_{z,i}^{(0)} = \frac{mg}{4} = \frac{15.206 \times 9.81}{4} \approx 37.3\,\text{N}
+\end{equation}
+
+\subsection{Phase B Warmup (100 ms)}
+During the first $100\,\text{ms}$ of Phase B, the MPC runs at the physics
+step rate ($2\,\text{ms}$) to rapidly build correct GRF estimates from the
+fresh measurement state.  After warmup, the rate drops to the nominal
+$30\,\text{ms}$ cadence.
+
+\section{Phase C: Trot MPC ($t > 3.5\,\text{s}$)}
+
+\subsection{Entry Gate}
+Phase C is entered only when:
+\begin{enumerate}[noitemsep]
+  \item $t > 3.5\,\text{s}$ (Phase B duration elapsed).
+  \item $p_z \geq 0.30\,\text{m}$ (robot is standing tall enough).
+  \item $|\theta| < 2^\circ$ (body is level — prevents trot on tilted stance).
+\end{enumerate}
+
+\subsection{Phase C Warmup (300 ms)}
+After Phase C is entered, the gait scheduler is activated but all 4 feet
+remain in stance for $300\,\text{ms}$ (1.5 gait cycles).  This gives the
+MPC time to smooth forces before the first swing leg lifts off.
+
+\subsection{Normal Operation}
+After warmup:
+\begin{enumerate}[noitemsep]
+  \item Gait scheduler provides the $(K\times4)$ contact schedule.
+  \item Lift-off transitions trigger \texttt{notify\_lift()} on the swing
+        controller (Raibert touchdown computed, trajectory initialised).
+  \item Stance legs: torques from MPC GRFs via $-\mat{J}^\top\vect{f}$.
+  \item Swing legs: torques from task-space PD via \eqref{eq:swing_pd}.
+  \item GRF solution is smoothed before application (Section~\ref{sec:grf_smooth}).
+\end{enumerate}
+
+\section{GRF Smoothing}
+\label{sec:grf_smooth}
+
+A first-order IIR filter blends consecutive QP solutions:
+
+\begin{equation}
+    \vect{f}^{(t)} = \beta\,\vect{f}_\text{new} + (1 - \beta)\,\vect{f}^{(t-1)}
+\end{equation}
+
+\begin{align}
+    \beta_\text{flat}  &= 0.75 \\
+    \beta_\text{stairs}&= 0.65
+\end{align}
+
+On stairs, a slower $\beta$ prevents force spikes when contact geometry
+changes abruptly.
+
+\subsection{GRF Re-Seeding}
+
+When a leg transitions from swing to stance, its stored GRF is near zero.
+If it falls below 70\% of the static equilibrium value, it is immediately
+re-seeded:
+
+\begin{equation}
+    \text{if } f_{z,i} < 0.7\,\frac{mg}{n_\text{stance}} \quad
+    \Rightarrow\quad \vect{f}_i \leftarrow \left[0,\;0,\;\frac{mg}{n_\text{stance}}\right]
+\end{equation}
+
+This eliminates the underforce window ($\approx$100\,ms) that occurs when
+the smoothed GRF is too low on the first tick of stance.
+
+\section{Collapse Detection and Recovery}
+
+If $p_z < 0.20\,\text{m}$ while the MPC is active:
+\begin{enumerate}[noitemsep]
+  \item Switch to PD stand controller.
+  \item Hold PD for $2.0\,\text{s}$.
+  \item Return to Phase B (all-stance MPC).
+\end{enumerate}
+
+% ══════════════════════════════════════════════════════════════════════════════
+\chapter{Flat-Ground Trotting: End-to-End Flow}
+% ══════════════════════════════════════════════════════════════════════════════
+
+\section{Step-by-Step Control Loop}
+
+Each physics step ($\Delta t_\text{phys} = 2\,\text{ms}$):
+
+\begin{enumerate}
+    \item \textbf{State read.} \texttt{StateEstimator.update()} reads
+          $\vect{x}$, joint positions, foot positions, contact forces.
+
+    \item \textbf{Contact detection.} Rolling-max buffer + height override
+          (Eq.~\ref{eq:contact_override}).
+
+    \item \textbf{Height integral.}
+          $e_{z,\text{int}} \mathrel{+}= (p_{z,\text{des}} - p_z)\,\Delta t_\text{phys}$.
+
+    \item \textbf{Phase logic.} Select Phase A/B/C based on simulation time
+          and height.
+
+    \item \textbf{MPC solve} (every $30\,\text{ms}$, rate-limited):
+        \begin{enumerate}
+            \item Build $\vect{x}_0 = \texttt{state.mpc\_x()}$.
+            \item Compute gait schedule $\mat{S} \in \{0,1\}^{K\times4}$.
+            \item Build $\mat{A}_c, \mat{B}_c$ for each horizon step $k$.
+            \item Discretise: $(\mat{A}_d^{(k)}, \mat{B}_d^{(k)}) =
+                  \text{ZOH}(\mat{A}_c^{(k)}, \mat{B}_c^{(k)}, \Delta t_\text{mpc})$.
+            \item Condense: $(\mat{A}_\text{qp}, \mat{B}_\text{qp})$.
+            \item Build reference $\mat{X}_\text{ref}$.
+            \item Compute $\mat{H}, \vect{g}$ (cost).
+            \item Build constraints $\mat{C}, \vect{lb}, \vect{ub}$.
+            \item Solve QP $\Rightarrow \mat{U}_\text{opt}$.
+            \item Extract $\vect{f}_{1:4} = \mat{U}_\text{opt}[0\!:\!12]$.
+            \item Apply GRF smoothing.
+        \end{enumerate}
+
+    \item \textbf{Swing detection.} Check lift-off transitions
+          ($\phi_i$ crossed duty boundary); call \texttt{notify\_lift()} with
+          Raibert touchdown target.
+
+    \item \textbf{Torque computation.}
+          \begin{itemize}[noitemsep]
+            \item Stance: $\vect{\tau}_i = -\mat{J}_i^\top\vect{f}_i + \vect{\tau}_\text{bias,i}$.
+            \item Swing: $\vect{\tau}_i = \mat{J}_i^\top\vect{F}_\text{task,i} + \vect{\tau}_\text{bias,i}$.
+          \end{itemize}
+
+    \item \textbf{Actuator remapping.} Internal $\to$ MuJoCo order.
+
+    \item \textbf{Torque limit.} Clip to $\pm 33.5\,\text{N\,m}$ per joint.
+
+    \item \textbf{Apply.} \texttt{data.ctrl[:] = ctrl}; \texttt{mj\_step()}.
+
+    \item \textbf{Log.} Write row to CSV debug log.
+\end{enumerate}
+
+% ══════════════════════════════════════════════════════════════════════════════
+\chapter{Stair Climbing System}
+\label{ch:stairs}
+% ══════════════════════════════════════════════════════════════════════════════
+
+\section{Stair Scene Geometry}
+
+The \texttt{scene\_stairs\_uniform.xml} scene contains:
+
+\begin{table}[H]
+\centering
+\caption{Stair scene geometry}
+\begin{tabular}{llll}
+\toprule
+\textbf{Section} & \textbf{x range} & \textbf{Surface $z$} & \textbf{Steps} \\
+\midrule
+Flat approach   & $x < 2.00\,\text{m}$           & $0.00\,\text{m}$  & — \\
+Ascending stairs& $2.00 \leq x < 3.40\,\text{m}$ & $0.06 \to 0.30\,\text{m}$ & 5 \\
+Top platform    & $3.40 \leq x < 4.40\,\text{m}$ & $0.30\,\text{m}$  & — \\
+Descending stairs & $4.40 \leq x < 5.80\,\text{m}$ & $0.24 \to 0.06\,\text{m}$ & 5 \\
+Flat exit       & $x \geq 5.80\,\text{m}$         & $0.00\,\text{m}$  & — \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent\textbf{Step parameters:}
+\begin{align*}
+    &\text{Riser height:} \quad h_r = 0.06\,\text{m} \\
+    &\text{Tread width:}  \quad w_t = 0.28\,\text{m} \\
+    &\text{Total height:} \quad H = 5 \times 0.06 = 0.30\,\text{m}
+\end{align*}
+
+\section{Terrain Mode Activation}
+
+The controller initialises in ``flat'' mode (terrain estimator is a no-op).
+The simulation loop calls \texttt{switch\_to\_terrain\_mode(``stairs'')} when
+the robot's $x$-position exceeds the approach threshold
+($x > 1.80\,\text{m}$, i.e.\ $0.20\,\text{m}$ before the first riser).
+
+At the switch:
+\begin{enumerate}[noitemsep]
+  \item Terrain estimator mode set to ``stairs''.
+  \item Nominal clearance anchored: $\ell = p_{z,\text{settled}} - z_\text{terrain}$.
+  \item Stairs-specific Q weights activated immediately.
+  \item Swing clearance changes: $0.08\,\text{m} \to 0.18\,\text{m}$ (adaptive).
+\end{enumerate}
+
+\section{Terrain Height Map}
+
+\subsection{Discrete Step Function}
+
+Used for touchdown z initialisation and failure detection:
+
+\begin{equation}
+    z_\text{terrain}(x) =
+    \begin{cases}
+        0 & x < 2.00 \\
+        \lceil\frac{x - 2.00}{0.28}\rceil \times 0.06 & 2.00 \leq x < 3.40
+                \quad\text{(ascending)} \\
+        0.30 & 3.40 \leq x < 4.40 \quad\text{(platform)} \\
+        0.30 - \lceil\frac{x - 4.40}{0.28}\rceil \times 0.06 & 4.40 \leq x < 5.80
+                \quad\text{(descending)} \\
+        0 & x \geq 5.80
+    \end{cases}
+\end{equation}
+
+\subsection{Smooth Ramp Approximation}
+
+Used for pitch\_ref and target\_pz to ensure smooth reference transitions:
+
+An $8\,\text{cm}$ linear pre-ramp before each riser edge blends the height
+continuously, preventing step-changes in the MPC reference.
+
+\section{Adaptive CoM Height}
+
+\subsection{Target Height}
+
+\begin{equation}
+    p_{z,\text{target}}(x, \ell) =
+    \underbrace{\frac{z_\text{smooth}(x + d_\text{hip}) + z_\text{smooth}(x - d_\text{hip})}{2}}_{\text{avg terrain under both hips}}
+    + \ell
+\end{equation}
+
+where $d_\text{hip} = 0.1934\,\text{m}$ and $\ell \approx 0.338\,\text{m}$ (nominal clearance).
+
+\subsection{Asymmetric Rate Limiter}
+
+\begin{equation}
+    \Delta p_{z,\text{des}} = \text{clip}\!\left(p_{z,\text{target}} - p_{z,\text{des}},\;
+    -r_\text{down}\,\Delta t,\; r_\text{up}\,\Delta t\right)
+\end{equation}
+
+\begin{align}
+    r_\text{up}   &= 0.12\,\text{m/s} \quad\text{(ascending — fast to prevent lag)} \\
+    r_\text{down} &= 0.04\,\text{m/s} \quad\text{(descending — slow to prevent drops)}
+\end{align}
+
+This means a $6\,\text{cm}$ riser is tracked in $\approx 250\,\text{ms}$ on
+ascent (vs.\ $1.5\,\text{s}$ at the original $0.04\,\text{m/s}$ symmetric rate
+which caused sustained overforce and roll crash).
+
+\section{Body Pitch Reference}
+
+\subsection{Geometric Derivation}
+
+The desired body pitch angle is computed from the terrain slope under the hip
+span:
+
+\begin{equation}
+    \theta_\text{ref} = \text{clip}\!\left(
+        \arctan\!\left(\frac{z_\text{smooth}(x + d_\text{hip}) - z_\text{smooth}(x - d_\text{hip})}
+                             {2\,d_\text{hip}}\right),\;
+        -0.21, 0.21\right)
+    \label{eq:pitch_ref}
+\end{equation}
+
+\begin{itemize}[noitemsep]
+  \item Ascending ($2.00 \to 3.40\,\text{m}$): $\theta_\text{ref} \approx +0.154\,\text{rad} \approx +8.8^\circ$ (nose-up).
+  \item Platform ($3.40 \to 4.40\,\text{m}$): $\theta_\text{ref} = 0$.
+  \item Descending ($4.40 \to 5.80\,\text{m}$): $\theta_\text{ref} \approx -0.154\,\text{rad} \approx -8.8^\circ$ (nose-down).
+\end{itemize}
+
+\textbf{Physical reason for negative pitch on descent:}  When front feet
+are on lower steps and rear feet are still higher, a level body shifts the CoM
+forward of the support polygon, creating a nose-dive torque.  By commanding
+$-8.8^\circ$ pitch reference, the MPC proactively distributes forces to
+maintain this geometry throughout descent.
+
+\textbf{Flat approach guard:}  The smooth height function has an $8\,\text{cm}$
+pre-ramp before $x = 2.00\,\text{m}$.  This would generate a phantom
+$+8^\circ$ pitch command on flat ground.  The guard returns $\theta_\text{ref} = 0$
+when $x < 2.00\,\text{m}$.
+
+\subsection{IIR Smoothing}
+
+The geometric pitch reference is filtered before passing to the MPC:
+
+\begin{equation}
+    \theta_\text{ref,smooth} \leftarrow 0.3\,\theta_\text{ref,smooth} + 0.7\,\theta_\text{ref,raw}
+\end{equation}
+
+The fast smoothing constant ($\alpha = 0.3$, settling in $\approx 2$ ticks)
+prevents the MPC from generating anti-pitch torques during the $3$--$6^\circ$
+lag that occurred with $\alpha = 0.5$.
+
+\section{Per-Foot Stair Touchdown Placement}
+
+\subsection{Tread Snapping}
+
+The Raibert heuristic computes a continuous touchdown x-position.  On stairs,
+this must be clamped to a safe zone within the target tread (margin: $4\,\text{cm}$
+from each riser edge):
+
+\begin{equation}
+    x_\text{td,safe} = \text{clip}\!\left(x_\text{Raibert},\;
+    x_\text{tread,lo} + \delta, \;
+    x_\text{tread,hi} - \delta \right), \quad \delta = 0.04\,\text{m}
+\end{equation}
+
+\subsection{Height Map Touchdown}
+
+The touchdown z-coordinate is set from the deterministic height map:
+
+\begin{equation}
+    z_\text{td} = z_\text{terrain}(x_\text{td,safe}) + r_\text{foot}
+\end{equation}
+
+where $r_\text{foot} = 0.022\,\text{m}$ is the foot sphere radius.
+
+This ensures the foot targets the correct tread surface even if the body has
+not yet risen to track the terrain.
+
+\section{Adaptive Swing Clearance}
+
+\begin{equation}
+    h_\text{sw}(z_\text{terrain}) =
+    h_\text{flat} + \min\!\left(1,\; \frac{z_\text{terrain}}{z_\text{ramp}}\right)
+    \times (h_\text{terrain} - h_\text{flat} - 0.01) + 0.01
+\end{equation}
+
+\begin{align*}
+    h_\text{flat} &= 0.08\,\text{m},\quad
+    h_\text{terrain} = 0.18\,\text{m},\quad
+    z_\text{ramp} = 0.10\,\text{m}
+\end{align*}
+
+As the terrain IIR estimate rises from $0 \to 0.30\,\text{m}$,
+swing clearance grows from $0.08 \to 0.18\,\text{m}$, ensuring
+the foot clears the step it is swinging to land on.
+
+\section{Early Touchdown Detection}
+
+When a swing leg physically contacts the terrain before its scheduled
+touchdown (e.g.\ the foot catches the riser face), the controller must
+stop pushing it forward and freeze it in place:
+
+\begin{equation}
+    \text{early\_td}[i] = \mathbf{1}\!\left[
+        c_{f,i} > 10\,\text{N}
+        \;\wedge\;
+        \frac{t - t_\text{liftoff}}{T_\text{swing}} > 0.60
+    \right]
+    \label{eq:early_td}
+\end{equation}
+
+The two guards in Eq.~\eqref{eq:early_td} are essential:
+
+\begin{enumerate}
+  \item \textbf{Guard 1 (terrain mode only):} In flat mode, early touchdown
+        is disabled.  The rolling-max buffer retains stance contact forces for
+        $\approx 20\,\text{ms}$ post-liftoff, causing false triggers.
+
+  \item \textbf{Guard 2 (60\% swing progress):} Feet hitting the \emph{riser
+        face} at 20--30\% swing progress would freeze far short of the safe
+        tread zone.  Requiring 60\% ensures the foot has crested the riser
+        and is descending toward the tread before early touchdown fires.
+\end{enumerate}
+
+When early touchdown is active:
+\begin{equation}
+    \vect{\tau}_i = \mat{J}_i^\top\!\left[\mat{K}_d\,(-\vect{v}_\text{foot})\right]
+    + \vect{\tau}_\text{bias,i}
+    \quad\text{(velocity damping only, no position error)}
+\end{equation}
+
+\section{Support Plane Estimation}
+
+\subsection{Purpose}
+
+When stance feet are on different stair steps, they are not coplanar.
+The support plane provides a best-fit terrain normal for rotating friction-cone
+constraints.
+
+\subsection{Least-Squares Plane Fit}
+
+Given $n \geq 3$ stance foot positions $\{\vect{p}_i\}$:
+
+\begin{enumerate}
+  \item Compute centroid: $\vect{c} = \frac{1}{n}\sum_i \vect{p}_i$.
+  \item Form $\mat{A} = [\vect{p}_1 - \vect{c},\; \ldots,\; \vect{p}_n - \vect{c}]^\top$.
+  \item Compute SVD: $\mat{A} = \mat{U}\mat{\Sigma}\mat{V}^\top$.
+  \item Normal: $\hat{\vect{n}} = \mat{V}[-1,:]$ (last row of $\mat{V}^\top$,
+        smallest singular value direction).
+  \item Flip if $n_z < 0$.
+\end{enumerate}
+
+\subsection{Support Frame Construction}
+
+\begin{align}
+    \hat{\vect{n}} &= \hat{\vect{n}} / \|\hat{\vect{n}}\| \\
+    \hat{\vect{x}}_\text{plane} &= \hat{\vect{x}}_\text{world} -
+    (\hat{\vect{x}}_\text{world}\cdot\hat{\vect{n}})\,\hat{\vect{n}}
+    \quad\text{(project world-}x\text{ onto plane)} \\
+    \hat{\vect{y}}_\text{plane} &= \hat{\vect{n}} \times \hat{\vect{x}}_\text{plane} \\
+    \mat{R}_\text{plane} &= [\hat{\vect{x}}_\text{plane},\;
+                              \hat{\vect{y}}_\text{plane},\;
+                              \hat{\vect{n}}]
+\end{align}
+
+$\mat{R}_\text{plane}$ is passed to the QP constraints for friction-cone
+rotation but \emph{not} used in the $\mat{B}$ matrix (moment arms stay in
+world frame).
+
+\section{IIR Terrain Tracking}
+
+The terrain estimator maintains an IIR-filtered estimate of the terrain height
+from stance foot z-positions:
+
+\begin{equation}
+    z_\text{terrain} \leftarrow 0.70\,z_\text{terrain} + 0.30\,\max\!\left(0,\;
+    \overline{z}_\text{stance} - r_\text{foot}\right)
+\end{equation}
+
+where $\overline{z}_\text{stance}$ is the mean z-position of all feet with
+$c_{f,i} > 10\,\text{N}$.  This estimate drives the adaptive swing clearance
+and is used as the ``current terrain'' baseline for touchdown offset.
+
+% ══════════════════════════════════════════════════════════════════════════════
+\chapter{Complete Constraints Reference}
+% ══════════════════════════════════════════════════════════════════════════════
+
+\begin{longtable}{p{4cm}p{4cm}p{6cm}}
+\caption{All constraints active in the QP and elsewhere}\\
+\toprule
+\textbf{Constraint} & \textbf{Equation} & \textbf{Purpose / Notes} \\
+\midrule
+\endfirsthead
+\multicolumn{3}{l}{\textit{(continued)}}\\
+\toprule
+\textbf{Constraint} & \textbf{Equation} & \textbf{Purpose / Notes} \\
+\midrule
+\endhead
+\bottomrule
+\endfoot
+
+Normal force min   & $\hat{\vect{n}}^\top\vect{f}_i \geq 5\,\text{N}$
+                   & Prevent foot from losing contact; ensure minimum support \\
+Normal force max   & $\hat{\vect{n}}^\top\vect{f}_i \leq 200\,\text{N}$
+                   & Leg structural limit \\
+Friction cone $+x$ & $\hat{\vect{t}}_x^\top\vect{f}_i \leq \mu\,\hat{\vect{n}}^\top\vect{f}_i$
+                   & Linearised pyramid, positive tangential \\
+Friction cone $-x$ & $-\hat{\vect{t}}_x^\top\vect{f}_i \leq \mu\,\hat{\vect{n}}^\top\vect{f}_i$
+                   & Linearised pyramid, negative tangential \\
+Friction cone $+y$ & $\hat{\vect{t}}_y^\top\vect{f}_i \leq \mu\,\hat{\vect{n}}^\top\vect{f}_i$
+                   & Linearised pyramid, positive lateral \\
+Friction cone $-y$ & $-\hat{\vect{t}}_y^\top\vect{f}_i \leq \mu\,\hat{\vect{n}}^\top\vect{f}_i$
+                   & Linearised pyramid, negative lateral \\
+Swing zero force   & $\vect{f}_i = \vect{0}$
+                   & Swing leg cannot exert force (3 equality constraints) \\
+Torque limit       & $|\tau_j| \leq 33.5\,\text{N\,m}$
+                   & Hardware safety limit, applied after all torque computation \\
+Collapse gate      & $p_z \geq 0.20\,\text{m}$
+                   & Trigger PD recovery if violated \\
+Trot gate          & $p_z \geq 0.30\,\text{m}$,\; $|\theta| < 2^\circ$
+                   & Phase C entry condition \\
+pz rate limit up   & $\dot{p}_{z,\text{des}} \leq 0.12\,\text{m/s}$
+                   & Smooth height increase on stairs \\
+pz rate limit down & $\dot{p}_{z,\text{des}} \geq -0.04\,\text{m/s}$
+                   & Smooth height decrease on stairs \\
+Contact threshold  & $c_{f,i} > 10\,\text{N}$
+                   & Minimum force to classify as stance (for early touchdown and state estimator) \\
+Early touchdown    & $\phi_\text{swing} > 0.60$
+                   & Guard against premature early touchdown detection \\
+Tread margin       & $x \in [x_\text{tread} + 0.04,\; x_\text{tread+1} - 0.04]$
+                   & Safe foot placement within each step \\
+Pitch clip         & $|\theta_\text{ref}| \leq 0.21\,\text{rad}$
+                   & Cap pitch reference at $\approx 12^\circ$ \\
+\end{longtable}
+
+% ══════════════════════════════════════════════════════════════════════════════
+\chapter{Module Dependency and Data Flow}
+% ══════════════════════════════════════════════════════════════════════════════
+
+\section{Module Dependency Graph}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=2cm,
+    mod/.style={rectangle, draw, fill=blue!8, rounded corners,
+                minimum width=3cm, minimum height=0.7cm, align=center, font=\small},
+    arr/.style={->, gray!60, thick}
+]
+\node[mod] (cfg) {config.py};
+\node[mod, below=0.5cm of cfg] (rp) {robot\_params.py};
+\node[mod, right=3cm of cfg] (dyn) {dynamics.py};
+\node[mod, right=3cm of rp] (sol) {mpc\_solver.py};
+\node[mod, below=0.5cm of rp] (se) {state\_estimator.py};
+\node[mod, below=0.5cm of se] (gs) {gait\_scheduler.py};
+\node[mod, below=0.5cm of gs] (sw) {swing\_controller.py};
+\node[mod, right=3cm of se] (tu) {torque\_utils.py};
+\node[mod, right=3cm of gs] (te) {terrain\_estimator.py};
+\node[mod, right=3cm of sw] (sp) {support\_plane.py};
+\node[mod, below=3cm of sol] (mc) {mpc\_controller.py};
+\node[mod, below=0.8cm of mc] (sim) {simulation.py};
+\node[mod, below left=0.5cm and 0.5cm of sim] (ft) {flat\_trot.py};
+\node[mod, below right=0.5cm and 0.5cm of sim] (sc) {stairs\_climb.py};
+
+\draw[arr] (cfg) -- (dyn);
+\draw[arr] (cfg) -- (sol);
+\draw[arr] (cfg) -- (se);
+\draw[arr] (cfg) -- (tu);
+\draw[arr] (cfg) -- (sw);
+\draw[arr] (cfg) -- (te);
+\draw[arr] (rp)  -- (dyn);
+\draw[arr] (rp)  -- (sol);
+\draw[arr] (rp)  -- (se);
+\draw[arr] (rp)  -- (tu);
+\draw[arr] (rp)  -- (sw);
+\draw[arr] (se)  -- (mc);
+\draw[arr] (dyn) -- (mc);
+\draw[arr] (sol) -- (mc);
+\draw[arr] (gs)  -- (mc);
+\draw[arr] (sw)  -- (mc);
+\draw[arr] (te)  -- (mc);
+\draw[arr] (tu)  -- (mc);
+\draw[arr] (sp)  -- (mc);
+\draw[arr] (mc)  -- (sim);
+\draw[arr] (sim) -- (ft);
+\draw[arr] (sim) -- (sc);
+\end{tikzpicture}
+\caption{Module dependency graph}
+\end{figure}
+
+\section{Per-Step Data Flow (Phase C)}
+
+\begin{enumerate}
+    \item \textbf{MuJoCo step} $\to$ \textbf{StateEstimator}: raw sensor data.
+    \item \textbf{StateEstimator} $\to$ \textbf{RobotState}: structured state.
+    \item \textbf{TerrainEstimator.update(state)}: IIR terrain height.
+    \item \textbf{TrotGait.schedule(t, dt, K)}: $(K\times4)$ contact bool.
+    \item \textbf{TrotGait.contact\_at(t)} $\to$ lift-off check:
+          if transition detected, \textbf{SwingController.notify\_lift()}.
+    \item \textbf{RigidBodyDynamics.Ac/Bc} for each $k$ $\to$ \textbf{ZOH} $\to$
+          $(\mat{A}_d^{(k)}, \mat{B}_d^{(k)})$.
+    \item \textbf{ConvexMPC.condense} $\to$ $(\mat{A}_\text{qp}, \mat{B}_\text{qp})$.
+    \item \textbf{make\_reference} $\to$ $\mat{X}_\text{ref}$.
+    \item \textbf{ConvexMPC.cost} $\to$ $(\mat{H}, \vect{g})$.
+    \item \textbf{ConvexMPC.constraints} $\to$ $(\mat{C}, \vect{lb}, \vect{ub})$.
+    \item \textbf{ConvexMPC.solve} $\to$ $\mat{U}_\text{opt}$.
+    \item GRF smooth + re-seed $\to$ $\vect{f}_{1:4}$.
+    \item \textbf{grf\_to\_joint\_torques}: $\vect{\tau}_\text{stance}$.
+    \item \textbf{SwingController.compute\_torques}: $\vect{\tau}_\text{swing}$.
+    \item Blend stance/swing torques by schedule.
+    \item \textbf{leg\_to\_ctrl} (reorder) $\to$ clip $\to$ \texttt{data.ctrl}.
+    \item \textbf{mj\_step()}.
+\end{enumerate}
+
+% ══════════════════════════════════════════════════════════════════════════════
+\chapter{Bug Fixes and Design Decisions}
+% ══════════════════════════════════════════════════════════════════════════════
+
+\begin{longtable}{p{0.4cm}p{3.2cm}p{5cm}p{5.5cm}}
+\caption{Complete bug fix and design decision log (19 items)}\\
+\toprule
+\textbf{\#} & \textbf{Location} & \textbf{Symptom / Root Cause} & \textbf{Fix} \\
+\midrule
+\endfirsthead
+\multicolumn{4}{l}{\textit{(continued)}}\\
+\toprule
+\textbf{\#} & \textbf{Location} & \textbf{Symptom / Root Cause} & \textbf{Fix} \\
+\midrule
+\endhead
+\bottomrule
+\endfoot
+
+1 & torque\_utils.py & Torque sign error: robot pushed itself into the ground.
+    MPC gives GRF = upward force; joint must push \emph{down}.
+  & Changed $+\mat{J}^\top\vect{f}$ to $-\mat{J}^\top\vect{f}$ \\
+2 & state\_estimator.py & Phase A$\to$B boundary: efc\_force drops to 0 for $\sim$300\,ms.
+    Contact reports NNNN; MPC sees all-swing, generates 3$\times$ overforce.
+  & Height-based override: force contacts=True when $p_z > 0.20\,\text{m}$ \\
+3 & config.py & Contact threshold $\tau_\text{cf} = 1\,\text{N}$ — below MuJoCo solver noise.
+  & Raised to $10\,\text{N}$ \\
+4 & mpc\_controller.py & Phase C reset pz\_des to NOMINAL\_HEIGHT (0.32\,m); body drops 18\,mm before first swing.
+  & Keep pz\_des = settled height (0.338\,m) throughout \\
+5 & gait\_scheduler.py & Gait phase measured from $t=0$; mid-cycle state at Phase C activation.
+  & Anchor gait phase to activation time $t_0$ via \texttt{activate(t)} \\
+6 & mpc\_controller.py & Q weights 10--50$\times$ too large (roll=100, pitch=200, pz=500); aggressive corrective forces destabilise trot.
+  & Matched to CasADi reference values \\
+7 & swing\_controller.py & Raibert overcorrection: $(t_\text{pred} + k_v)\,v_\text{actual}$ applied as one term; 3.5$\times$ too large.
+  & Separated nominal drift ($v_\text{cmd}\,t_\text{pred}$) from error correction ($k_v\,(v_\text{actual}-v_\text{cmd})$) \\
+8 & mpc\_controller.py & cmd\_vx/vy in body frame; Raibert needs world frame.
+  & Rotate by yaw: $[v_x^w, v_y^w]^\top = \mat{R}_z(\psi)[v_x^\text{cmd}, v_y^\text{cmd}]^\top$ \\
+9 & swing\_controller.py & Foot velocity used only 3-DOF leg Jacobian; ignored body rolling/pitching.
+  & Use full $(3\times n_v)$ Jacobian: $\vect{v}_\text{foot} = \mat{J}_\text{full}\,\dot{\vect{q}}$ \\
+10 & dynamics.py & Moment arm rotated into support-plane frame while forces stayed in world frame; physically wrong cross product.
+   & Keep $\vect{r}_i$ in world frame; rotate only friction cones \\
+11 & mpc\_solver.py & GRF smoothing was a no-op (result not stored back).
+   & Fixed: $\texttt{self.\_grf} = \beta\,\vect{f}_\text{new} + (1-\beta)\,\texttt{self.\_grf}$ \\
+12 & mpc\_controller.py & Terrain mode not reset in \texttt{simulation.reset()}; stair mode bled into viewer run.
+   & Added \texttt{terrain.set\_mode(``flat'')} to \texttt{reset()} \\
+13 & swing\_controller.py & Early touchdown fired on buffer bleed (20\,ms post-liftoff) in flat mode.
+   & Guard 1: early touchdown disabled in flat mode \\
+14 & swing\_controller.py & Early touchdown at 20\% swing progress froze foot on riser face, far short of tread.
+   & Guard 2: require $>60\%$ swing progress before early touchdown \\
+15 & terrain\_estimator.py & Smooth height pre-ramp generates phantom $+8^\circ$ pitch on flat approach.
+   & Guard: return 0.0 when $x < 2.00\,\text{m}$ \\
+16 & mpc\_controller.py & stairs\_Q not activated until $x > 2.00\,\text{m}$; first step hit with base Q (py=1, vy=2).
+   & Activate stairs\_Q as soon as terrain mode switches \\
+17 & mpc\_controller.py & pitch\_ref IIR $\alpha=0.5$ caused 3--6$^\circ$ lag; MPC generated anti-pitch torques opposing climb.
+   & Changed to $\alpha=0.3$ (70\% new, 30\% old) \\
+18 & mpc\_controller.py & Symmetric pz rate limiter $0.05\,\text{m/s}$: 30\,mm riser took 600\,ms; sustained overforce + roll crash.
+   & Asymmetric: $0.12\,\text{m/s}$ up, $0.04\,\text{m/s}$ down \\
+19 & mpc\_controller.py & GRF seed threshold 50\% insufficient; 100\,ms underforce window on new stance foot.
+   & Raised to 70\% seed threshold \\
+\end{longtable}
+
+% ══════════════════════════════════════════════════════════════════════════════
+\chapter{Numerical Summary}
+% ══════════════════════════════════════════════════════════════════════════════
+
+\begin{table}[H]
+\centering
+\caption{Key numerical parameters}
+\begin{tabular}{ll}
+\toprule
+\textbf{Parameter} & \textbf{Value} \\
+\midrule
+Physics timestep       & $2\,\text{ms}$ (500\,Hz) \\
+MPC solve rate         & $30\,\text{ms}$ (33\,Hz) \\
+MPC horizon $K$        & 10 steps \\
+Gait period $T$        & $0.40\,\text{s}$ (2.5\,Hz) \\
+Duty cycle $d$         & 50\% \\
+Stance time            & $0.20\,\text{s}$ \\
+Swing time             & $0.20\,\text{s}$ \\
+State dimension $n_s$  & 13 \\
+Input dimension $n_u$  & 12 (4 feet $\times$ 3 forces) \\
+QP size (stacked)      & $H \in \R^{120\times120}$ \\
+Regularisation $\alpha$ & $3\times10^{-4}$ \\
+Friction coefficient $\mu$ & 0.70 \\
+Foot normal force range & $[5, 200]\,\text{N}$ \\
+Torque limit per joint & $33.5\,\text{N\,m}$ \\
+Phase A duration       & $1.5\,\text{s}$ \\
+Phase B duration       & $2.0\,\text{s}$ \\
+Phase C warmup         & $0.30\,\text{s}$ \\
+Nominal CoM height     & $0.32\,\text{m}$ \\
+Settled CoM height     & $\approx 0.338\,\text{m}$ \\
+Collapse threshold     & $0.20\,\text{m}$ \\
+Trot ready threshold   & $0.30\,\text{m}$ \\
+Contact force threshold & $10\,\text{N}$ \\
+GRF blend (flat)       & $\beta = 0.75$ \\
+GRF blend (stairs)     & $\beta = 0.65$ \\
+Stair approach x       & $1.80\,\text{m}$ \\
+Flat Raibert $k_{v,x}$ & $0.4T = 0.16\,\text{m\,s}$ \\
+Flat Raibert $k_{v,y}$ & $0.05T = 0.02\,\text{m\,s}$ \\
+Swing clearance (flat) & $0.08\,\text{m}$ \\
+Swing clearance (stairs) & $0.08\to0.18\,\text{m}$ (adaptive) \\
+pz rate up             & $0.12\,\text{m/s}$ \\
+pz rate down           & $0.04\,\text{m/s}$ \\
+Pitch IIR $\alpha$     & $0.30$ (70\% new) \\
+Tread safety margin    & $0.04\,\text{m}$ \\
+Early touchdown guard  & $>60\%$ swing progress \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ══════════════════════════════════════════════════════════════════════════════
+\chapter{Conclusions}
+% ══════════════════════════════════════════════════════════════════════════════
+
+\section{Summary}
+
+This project implements a complete convex MPC trot controller for the Unitree
+Go2 quadruped robot in MuJoCo simulation.  The controller:
+
+\begin{enumerate}
+    \item Formulates the stance-force problem as a convex QP (13 states,
+          12 inputs, $K=10$ horizon) solvable in real time.
+    \item Uses a three-phase state machine (PD settle $\to$ all-stance MPC
+          $\to$ trot MPC) to ensure smooth transitions.
+    \item Implements a minimum-jerk swing trajectory with Raibert touchdown
+          placement for forward progression.
+    \item Extends to stair climbing through terrain-aware references
+          (adaptive $p_z$, pitch reference), per-foot stair snapping,
+          adaptive swing clearance, support-plane friction cones, and
+          early touchdown detection.
+    \item Documents 19 bug fixes across 4+ debugging iterations, covering
+          signal processing (contact detection), control theory (Raibert
+          formulation, frame conventions), and numerical stability (GRF
+          smoothing, rate limiters).
+\end{enumerate}
+
+\section{Limitations and Future Work}
+
+\begin{itemize}[noitemsep]
+    \item The SRB model ignores leg mass ($\approx 10\%$ of total), which
+          limits accuracy during dynamic swing.  A whole-body MPC would improve
+          this at significant computational cost.
+    \item The trot gait uses a fixed period.  Adaptive gait timing (speed-dependent
+          $T$) would improve efficiency over a wider velocity range.
+    \item The terrain estimator uses a hardcoded stair geometry.  A general
+          elevation map (e.g.\ from depth sensors) would enable uneven terrain.
+    \item The friction coefficient $\mu = 0.7$ is fixed.  Online friction
+          estimation from force/slip measurements would improve robustness.
+    \item The controller has been validated only in simulation.  Sim-to-real
+          transfer requires addressing actuator delays, sensor noise, and
+          unmodelled flexibility.
+\end{itemize}
+
+% ══════════════════════════════════════════════════════════════════════════════
+\bibliographystyle{plain}
+\begin{thebibliography}{9}
+
+\bibitem{diCarlo2018}
+J.~Di Carlo, P.~M.~Wensing, B.~Katz, G.~Bledt, and S.~Kim,
+``Dynamic locomotion in the MIT Cheetah 3 through convex model-predictive control,''
+in \textit{Proc. IEEE/RSJ Int. Conf. Intelligent Robots and Systems (IROS)},
+pp. 7440--7447, 2018.
+
+\bibitem{raibert1986}
+M.~H.~Raibert,
+\textit{Legged Robots That Balance}.
+MIT Press, Cambridge, MA, 1986.
+
+\bibitem{unitreeGo2}
+Unitree Robotics,
+``Go2 Robot Dog,''
+\texttt{https://www.unitree.com/go2/}, 2023.
+
+\bibitem{mujoco}
+E.~Todorov, T.~Erez, and Y.~Tassa,
+``MuJoCo: A physics engine for model-based control,''
+in \textit{Proc. IEEE/RSJ IROS}, pp. 5026--5033, 2012.
+
+\end{thebibliography}
+
+\end{document}
