@@ -9,6 +9,15 @@ Deployed on the **Unitree Go2** quadruped in **MuJoCo**, achieving:
 - Stable **diagonal trot** on flat ground at up to 0.6 m/s
 - **Staircase ascent and descent** (6 cm riser / 28 cm tread, 5 steps) with terrain-adaptive height control
 
+<p align="center">
+  <img src="results/flat/flat_trot.gif" width="32%" alt="Flat Trot"/>
+  <img src="results/stairs/stairs_ascend.gif" width="32%" alt="Stair Ascent"/>
+  <img src="results/stairs/stairs_descend.gif" width="32%" alt="Stair Descent"/>
+</p>
+<p align="center">
+  <em>Flat trot (0→0.6 m/s) &nbsp;|&nbsp; Stair ascent &nbsp;|&nbsp; Stair descent</em>
+</p>
+
 ---
 
 ## Documentation

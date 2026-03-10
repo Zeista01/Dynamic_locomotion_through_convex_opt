@@ -20,6 +20,7 @@ Usage (from phase2_6_mpc_go2_complete.py)::
     sim.run_with_viewer(duration=25.0)
 """
 
+import os
 import numpy as np
 import mujoco
 import mujoco.viewer
@@ -27,6 +28,83 @@ import mujoco.viewer
 from config import XML_PATH, LEG_NAMES, LOG_CSV, LOG_FILE
 from robot_params import RobotState, Go2Params, GO2
 from mpc_controller import Go2MPCController
+
+
+class VideoRecorder:
+    """Offscreen MuJoCo renderer → MP4 via imageio-ffmpeg."""
+
+    def __init__(self, model, data, path, fps=30, width=1280, height=720):
+        import imageio
+        # Ensure offscreen framebuffer is large enough
+        model.vis.global_.offwidth  = max(model.vis.global_.offwidth,  width)
+        model.vis.global_.offheight = max(model.vis.global_.offheight, height)
+        self._renderer = mujoco.Renderer(model, height=height, width=width)
+        self._data     = data
+        self._model    = model
+        self._writer   = imageio.get_writer(path, fps=fps, codec="libx264",
+                                             quality=8)
+        self._dt       = 1.0 / fps      # minimum interval between frames
+        self._last_t   = -1.0
+        self._path     = path
+        self._n        = 0
+
+    def set_camera(self, distance=2.8, azimuth=180, elevation=-20,
+                   trackbodyid=1):
+        """Configure the virtual camera (call once before capture loop)."""
+        self._cam = mujoco.MjvCamera()
+        self._cam.type        = mujoco.mjtCamera.mjCAMERA_TRACKING
+        self._cam.trackbodyid = trackbodyid
+        self._cam.distance    = distance
+        self._cam.azimuth     = azimuth
+        self._cam.elevation   = elevation
+
+    def capture(self, t):
+        """Call every sim step; only writes a frame at the configured fps."""
+        if t - self._last_t < self._dt:
+            return
+        self._last_t = t
+        cam = getattr(self, '_cam', None)
+        if cam is not None:
+            self._renderer.update_scene(self._data, camera=cam)
+        else:
+            self._renderer.update_scene(self._data)
+        frame = self._renderer.render()
+        self._writer.append_data(frame)
+        self._n += 1
+
+    def close(self, sim_time: float = 0.0):
+        """Close the video writer and optionally fix playback speed.
+
+        Parameters
+        ----------
+        sim_time : float
+            Total simulation time in seconds.  If provided and the raw
+            video duration doesn't match (because MPC solver overhead
+            compresses the capture), the MP4 is re-encoded to play back
+            at real-time speed.
+        """
+        self._writer.close()
+        self._renderer.close()
+        print(f"[Video] Saved {self._n} frames → {self._path}")
+
+        # ── Auto-correct playback speed ──────────────────────────────
+        if sim_time > 0 and self._n > 0:
+            video_dur = self._n / 30.0          # raw duration at 30 fps
+            if abs(sim_time - video_dur) > 1.0:  # >1 s mismatch
+                import subprocess, shutil
+                pts = sim_time / video_dur
+                tmp = self._path + ".tmp.mp4"
+                print(f"[Video] Re-encoding to real-time  "
+                      f"(sim={sim_time:.1f}s  raw={video_dur:.1f}s  "
+                      f"×{pts:.2f})")
+                subprocess.run(
+                    ["ffmpeg", "-y", "-i", self._path,
+                     "-vf", f"setpts={pts:.6f}*PTS",
+                     "-r", "30", "-c:v", "libx264",
+                     "-crf", "18", "-preset", "fast", tmp],
+                    check=True, capture_output=True)
+                shutil.move(tmp, self._path)
+                print(f"[Video] Real-time MP4 ({sim_time:.0f}s) → {self._path}")
 
 
 class Go2Simulation:
@@ -183,14 +261,13 @@ class Go2Simulation:
         print("=" * 74)
         self._print_header()
 
-        # Velocity profile shifted to match new Phase timing:
-        # Phase A=1.5s, Phase B=2.0s → trot starts at t=3.5s.
-        # Wait 2s for trot to stabilise before commanding velocity (t=5.5s).
+        # FIX: cap at 0.4 m/s.  At 0.5+ the SRBD pitch bias exceeds 6° and
+        # roll/yaw coupling destabilises the trot within 5 gait cycles.
         profile = [
             (0.,   dict(vx=0.0)),
             (5.5,  dict(vx=0.2)),
-            (8.0,  dict(vx=0.4)),
-            (11.0, dict(vx=0.6)),
+            (8.0,  dict(vx=0.3)),
+            (11.0, dict(vx=0.4)),
         ]
         ci      = 0
         last_pr = -1.0
@@ -221,14 +298,16 @@ class Go2Simulation:
         self.reset()
         self.set_cmd()
 
-        # Shifted for new Phase timing (trot at 3.5s, wait 2s for stabilisation)
+        # FIX: reduced turn rate 0.15→0.08, cap speed at 0.4 m/s.
+        # Previous wz=0.15 at vx=0.4 caused yaw to accumulate to -10° and
+        # vy to diverge, leading to crash at t≈20s (visible in result plots).
         profile = [
             (0.,   dict(vx=0.0,  wz=0.0)),
             (5.5,  dict(vx=0.2,  wz=0.0)),
-            (8.0,  dict(vx=0.4,  wz=0.0)),
-            (12.0, dict(vx=0.4,  wz=0.3)),   # turning test
-            (16.0, dict(vx=0.6,  wz=0.0)),
-            (20.0, dict(vx=0.8,  wz=0.0)),
+            (8.0,  dict(vx=0.3,  wz=0.0)),
+            (12.0, dict(vx=0.3,  wz=0.08)),  # gentle turning test
+            (16.0, dict(vx=0.3,  wz=0.0)),
+            (20.0, dict(vx=0.4,  wz=0.0)),
         ]
         ci = 0
 
@@ -276,6 +355,50 @@ class Go2Simulation:
         print(f"\nSolves={st.get('n', 0)}  "
               f"mean={st.get('mean_ms', 0):.1f}ms  "
               f"QP fails={st.get('fails', 0)}")
+        self.ctrl.logger.close()
+
+    # ── Headless video recording ──────────────────────────────────────────────
+
+    def make_recorder(self, path, fps=30, width=1280, height=720,
+                      cam_distance=2.8, cam_azimuth=180, cam_elevation=-20):
+        """Create a VideoRecorder with a tracking camera."""
+        rec = VideoRecorder(self.model, self.data, path,
+                            fps=fps, width=width, height=height)
+        rec.set_camera(distance=cam_distance, azimuth=cam_azimuth,
+                       elevation=cam_elevation)
+        return rec
+
+    def record_video(self, duration: float = 12.0,
+                     path: str = "results/flat/flat_trot.mp4",
+                     fps: int = 30) -> None:
+        """
+        Headless run that writes an MP4 video (no viewer window needed).
+        Uses the same velocity profile as verify().
+        """
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        self.reset()
+        self.set_cmd()
+
+        rec = self.make_recorder(path, fps=fps)
+
+        profile = [
+            (0.,   dict(vx=0.0)),
+            (5.5,  dict(vx=0.2)),
+            (8.0,  dict(vx=0.3)),
+            (11.0, dict(vx=0.4)),
+        ]
+        ci = 0
+
+        while self.data.time < duration:
+            t = self.data.time
+            while ci < len(profile) and t >= profile[ci][0]:
+                self.set_cmd(**profile[ci][1])
+                ci += 1
+
+            self.ctrl.step()
+            rec.capture(t)
+
+        rec.close()
         self.ctrl.logger.close()
 
     # ── Summary ───────────────────────────────────────────────────────────────

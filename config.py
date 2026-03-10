@@ -23,7 +23,7 @@ XML_PATH = "/home/stanny/unitree_ws/unitree_mujoco/unitree_robots/go2/scene.xml"
 #   3 = every MPC solve
 #   4 = every control step (very verbose)
 # =============================================================================
-DEBUG_LEVEL = 2
+DEBUG_LEVEL = 1
 LOG_CSV     = True
 LOG_FILE    = "data/mpc_debug_log.csv"
 

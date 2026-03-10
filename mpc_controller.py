@@ -239,11 +239,77 @@ class Go2MPCController:
         # the body sag at the front, which pitched up.  At pz=100, height
         # tracking is 67% of flat-Q strength — strong enough to prevent sag
         # while still allowing pitch Q=120 to dominate on stairs (1.2:1 ratio).
+        # Stairs Q: with corrected composite inertia, less aggressive weights
+        # are needed since the MPC now correctly models angular authority.
+        # FIX: roll Q 40→60, ωx 5→10 — the primary crash mode on stairs is
+        # ROLL divergence from asymmetric GRF (front feet on step push harder
+        # than rear feet on flat → roll torque).  With roll=40 the MPC penalty
+        # for 5° roll error was only 40*(0.087)²=0.30 — negligible vs pz penalty.
+        # At roll=60: 60*(0.087)²=0.45 — comparable to pitch penalty, ensuring
+        # the MPC distributes forces to zero roll torque FIRST.
+        # pitch Q 80→65: with corrected inertia the MPC generates sufficient
+        # pitch correction at lower Q.  High pitch Q drives asymmetric forces
+        # that couple into roll on diagonal stance.
+        # FIX: pz 80→50 — high pz Q forces the MPC to push hard on front feet
+        # (which are on the step) to maintain height, creating a pitch-up torque
+        # that drove pitch to +14°.  At pz=50, the robot sags 1-2cm during step
+        # transitions but pitch stays within ±10°.
+        # pitch 65→85 — with duty=0.85 giving 70% 4-foot overlap, roll coupling
+        # from pitch correction is much reduced, so we can safely increase pitch Q.
+        # Stairs Q weights — pz-DOMINANT over pitch (2:1 ratio).
+        # Previous: pitch=85, pz=50 (pitch-dominant) → MPC sacrificed height
+        # for pitch correction → height oscillation → pitch/roll cascade → crash.
+        # Fix: pz=100 (=flat), pitch=50.  Height stability prevents the
+        # vertical bouncing that couples into pitch and then roll.
+        # roll=80, ωx=15: roll divergence is the kill mode on stairs.
+        # ωy=25: strong pitch-rate damping prevents overshoot past pitch_ref.
+        # TUNED from run analysis — pitch divergence to +14° on platform:
+        #
+        # ROOT CAUSE 1: pitch Q=25 too weak on platform (penalty 1.09 for 12°).
+        # ROOT CAUSE 2: pitch_ref capped at 5.2° while terrain slope is 8.8°,
+        #   creating a permanent 3.6° "phantom error" during ascent.  The MPC
+        #   wasted force correcting terrain-induced pitch, causing roll coupling.
+        # ROOT CAUSE 3: the wasted correction accumulated extra pitch momentum
+        #   that carried onto the platform where Q=25 couldn't damp it.
+        #
+        # FIX STRATEGY: reduce pitch ERROR during ascent (via pitch_ref cap
+        #   increase in terrain_estimator.py), then moderate Q handles platform.
+        #
+        # pitch Q 25→35: conservative increase. Q=55 caused stumble at step 5
+        #   (t=35s) from aggressive pitch correction during 2-foot diagonal
+        #   stance.  Q=35 provides 40% more correction on platform (penalty
+        #   35×0.14²=0.69 for 8° error) without destabilizing ascent.
+        #   Roll Q=120 remains 3.4× dominant.
+        #
+        # ωy 15→20: 33% more pitch-rate damping.  At stair riser impact,
+        #   pitch rate ~15°/s (0.26 rad/s): penalty 15×0.26²=1.01 → 20×0.26²
+        #   =1.35.  Prevents pitch overshoot entering the platform.
+        #
+        # State order: [φ, θ, ψ, px, py, pz, ωx, ωy, ωz, vx, vy, vz, -g]
+        #
+        # Phase-adaptive Q: contradictory requirements between ascent and platform.
+        #   Ascent: high ωy (20) needed to damp step-impact perturbations.
+        #   Platform: low ωy (12) needed for pitch correction bandwidth.
+        # Solution: two Q vectors blended by terrain slope (|pitch_ref|).
+        # stairs_Q: used during ascent/descent (|pitch_ref| > 0).
         self._stairs_Q = np.array([
-            60., 120.,  1.,     # roll (STRONG — kill mode), pitch, yaw
-             1.,  15., 100.,    # px, py, pz (↑ from 60 — reduce flat pitch)
-             8.,  15.,  1.,     # ωx (roll-rate damp), ωy (pitch-rate damp), ωz
-            25.,  15.,  8.,     # vx (prevent surge), vy, vz
+           150.,  50.,  5.,     # roll, pitch, yaw
+             1.,  15., 100.,    # px, py, pz
+            30.,  20.,  5.,     # ωx, ωy, ωz
+            15.,  20.,  8.,     # vx, vy, vz
+             0.,                # -g
+        ], dtype=float)
+        # platform_Q: for flat sections in stairs mode (|pitch_ref| ≈ 0).
+        # Tuning iteration results (platform phase):
+        #   ωy=12, roll=40: mean=1.6° (good), |max|=11.7° (oscillations)
+        #   ωy=20 (stairs): mean=7.0° (overdamped, no recovery)
+        # Split the difference: ωy=15, roll=60, ωx=8 for post-stair damping
+        # while preserving pitch correction bandwidth.
+        self._platform_Q = np.array([
+            60.,  85.,  8.,     # roll (↑ damp oscillations), pitch (↑ 55→85), yaw (drift ctrl)
+             1.,   1., 100.,    # px, py, pz
+             8.,  15.,  3.,     # ωx (↑ roll damp), ωy (15: balanced), ωz
+            15.,   8.,  5.,     # vx, vy, vz
              0.,                # -g
         ], dtype=float)
 
@@ -522,6 +588,13 @@ class Go2MPCController:
     def _apply(self, ctrl: np.ndarray) -> None:
         self.data.ctrl[:] = ctrl
         mujoco.mj_step(self.model, self.data)
+        # mj_forward recomputes derived quantities (contacts, sensor data,
+        # kinematics) so the state estimator reads fresh values on the next
+        # step() call.  Without this, the estimator reads stale pre-step
+        # data, causing trajectory divergence on stairs (roll crash at t≈37s).
+        # The interactive viewer calls mj_forward via viewer.sync(), which
+        # is why the viewer run succeeded while headless failed.
+        mujoco.mj_forward(self.model, self.data)
 
     def _run_mpc(self, state: RobotState) -> None:
         x0  = state.mpc_x()
@@ -580,7 +653,11 @@ class Go2MPCController:
             #   UP:   0.12 m/s = 3.0mm/tick → 30mm riser in 10 ticks (250ms)
             #   DOWN: 0.04 m/s = 1.0mm/tick → gentle descent, no sudden drop
             #   OVERFORCE window: 600ms → 250ms (58% reduction).
-            _PZ_RATE_UP   = 0.12   # m/s — ascending
+            # FIX: reduced UP rate 0.12→0.06 m/s.  At 0.12, a 30mm half-riser
+            # jump tracks in 250ms, creating a sustained pz error that drives
+            # asymmetric GRF (front feet push harder → roll torque).
+            # At 0.06, the same jump tracks in 500ms — gentler force transients.
+            _PZ_RATE_UP   = 0.06   # m/s — ascending (was 0.12)
             _PZ_RATE_DOWN = 0.04   # m/s — descending
             pz_error = target_pz - self.pz_des
             if pz_error > 0:
@@ -602,14 +679,19 @@ class Go2MPCController:
                                       + 0.7 * raw_pitch_ref)
             pitch_ref = self._pitch_ref_smooth
 
-            # FIX: Activate _stairs_Q as soon as terrain mode is active — NOT
-            # just when front hip is over stairs (x_body > 1.807).
-            # Root cause of second failure: the robot hits the first step at
-            # x=1.74 while STILL using base Q (py=1, vy=2). The diagonal
-            # stance (FL on step, RR on flat) creates lateral roll torques that
-            # the base Q cannot resist for the ~0.3s before front_hip_x>2.0.
-            # Result: vy grew from 0 to 0.38 m/s in the ~1s before rollover.
-            Q_active = self._stairs_Q
+            # Phase-adaptive Q selection based on position (not pitch_ref).
+            # pitch_ref oscillates as hips cross step edges, causing Q weight
+            # oscillation that destabilizes roll during ascent.
+            # Position-based selection is stable and deterministic.
+            # Terrain layout: ascent [2.0,3.4], platform [3.4,4.4], descent [4.4,5.8]
+            x = state.pos[0]
+            if x > 1.90:
+                if 3.30 <= x <= 4.50:
+                    Q_active = self._platform_Q   # top platform: low ωy for recovery
+                elif x > 5.70:
+                    Q_active = self._platform_Q   # post-descent flat: low ωy
+                else:
+                    Q_active = self._stairs_Q     # slopes: high ωy for damping
 
         cmd  = np.array([self.cmd_vx, self.cmd_vy, self.cmd_wz])
         # FIX 9: pass terrain for per-step pitch_ref and pz_des in horizon.
@@ -664,7 +746,7 @@ class Go2MPCController:
         # At β=0.85: stale forces persist 7+ ticks, causing ±50% wr oscillation.
         # At β=0.50: force changes too fast, causing pitch/roll oscillation.
         # β=0.65: tracks QP changes in 4 ticks (~100ms), ±30% wr oscillation.
-        beta = 0.75 if self.terrain.is_flat() else 0.65
+        beta = 0.85 if self.terrain.is_flat() else 0.50
 
         if self._trot_active and not np.all(~schedule[0]):
             n_stance = int(schedule[0].sum())

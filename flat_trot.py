@@ -95,7 +95,11 @@ if __name__ == "__main__":
     # CSV log written to mpc_debug_log.csv for post-run analysis.
     sim.verify(duration=12.0)
 
-    # ── Step 2: Interactive viewer (25 seconds) ───────────────────────────────
+    # ── Step 2: Record MP4 video (headless) ─────────────────────────────────
+    print("\nRecording MP4 video (headless)...")
+    sim.record_video(duration=12.0, path="results/flat/flat_trot.mp4", fps=30)
+
+    # ── Step 3: Interactive viewer (25 seconds) ───────────────────────────────
     # Opens the MuJoCo passive viewer.
     # Ramps velocity 0 → 0.2 → 0.4 → 0.4 (turning) → 0.6 → 0.8 m/s.
     # Close the window or press Ctrl-C to stop.

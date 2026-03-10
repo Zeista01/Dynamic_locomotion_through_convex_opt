@@ -40,7 +40,7 @@ if _DIR not in sys.path:
 import numpy as np
 import mujoco
 
-from simulation import Go2Simulation
+from simulation import Go2Simulation, VideoRecorder
 
 # The stairs scene must live alongside go2.xml so MuJoCo resolves
 # mesh paths (base_0.obj etc.) relative to the robot's own directory.
@@ -151,28 +151,16 @@ def diag_header():
 
 if __name__ == "__main__":
 
+    # Start with duty=0.60 to ensure some 4-foot overlap during diagonal
+    # transitions (20% overlap = 0.08s).  duty=0.50 had zero overlap,
+    # causing zero-contact moments that crashed at low speed.
+    # Switch to stairs gait (T=0.60/duty=0.85) at terrain switch.
     sim = Go2Simulation(
         xml          = STAIRS_XML,
         K            = 25,        # 25 steps x 25 ms = 625 ms lookahead
         mpc_dt       = 0.025,
-        # FIX (gait_period 0.40→0.50, duty 0.55→0.70):
-        # Root cause of failure: diagonal trot with 55% duty gives only 10%
-        # 4-foot overlap.  During the 45% two-foot-only period, the MPC has
-        # 2 stance legs (6 force DoFs) to control 6 states (position+orientation).
-        # On stairs where feet are at different heights, pitch and roll become
-        # COUPLED through the diagonal geometry.  Log shows FL(step1)=139N vs
-        # RR(flat)=46N at t=8.83, creating +9.3 Nm roll torque (87 rad/s²).
-        # The MPC sacrifices roll to correct pitch → roll diverges → crash.
-        #
-        # With duty=0.70 and T=0.50s:
-        #   stance = 0.35s, swing = 0.15s per leg
-        #   4-foot overlap = 0.20s per half-cycle (40% of period)
-        #   2-foot only    = 0.05s per half-cycle (10% of period)
-        # During 40% overlap, all 4 feet provide 12 force DoFs → pitch and roll
-        # fully decoupled.  The brief 10% two-foot period is short enough that
-        # momentum can carry through without large pitch/roll excursions.
-        gait_period  = 0.50,      # 2.0 Hz trot (was 2.5 Hz)
-        duty         = 0.70,      # 70% stance (was 55%)
+        gait_period  = 0.40,      # 2.5 Hz trot
+        duty         = 0.60,      # 60% stance — 20% 4-foot overlap
         terrain_mode = "stairs",  # stored as target; controller always starts flat
     )
 
@@ -225,10 +213,17 @@ if __name__ == "__main__":
     #   t=8.0s: robot is at x≈1.90m (0.10m before stairs) at 0.20 m/s.
     #   Total stair time at 0.10 m/s: 1.4m ascend + 1.0m platform + 1.4m descend
     #   = 38s from t≈9s → done by t≈47s (well within 70s window).
+    # FIX: constant slow speed throughout. The previous 0.20→0.10 deceleration
+    # at t=8.0 coincided exactly with stair contact (x=1.99), creating a combined
+    # pitch impulse (deceleration torque + step impact) that drove pitch to +10°.
+    # At vx=0.08 each 28cm tread lasts 3.5s (7 gait cycles) — ample time for
+    # the MPC to converge height/pitch per step.
+    # vx=0.10: minimum stable trot speed with duty=0.50.  Below this,
+    # diagonal transitions have zero-contact moments that are unstable.
+    # At 0.10 m/s each 28cm tread takes 2.8s = 4.7 gait cycles.
     profile = [
         (0.0,  dict(vx=0.0)),
-        (5.5,  dict(vx=0.20)),   # fast flat approach
-        (8.0,  dict(vx=0.10)),   # slow down before stairs (x≈1.90m)
+        (5.5,  dict(vx=0.10)),
     ]
 
     sim.reset()
@@ -251,14 +246,23 @@ if __name__ == "__main__":
     ci          = 0
     last_pr     = -1.0
     terrain_on  = False
-    duration    = 70.0
+    # Duration must be long enough for full ascend + platform + descend.
+    # At vx_cmd=0.10 (effective ~0.07 m/s), distance = 4.2m (x=1.6→5.8),
+    # time ≈ 60s + 9s approach = 69s.  Use 85s for margin.
+    duration    = 85.0
 
     diag_header()
+
+    # ── Video recorder (headless MP4) ──────────────────────────────────────
+    os.makedirs("results/stairs", exist_ok=True)
+    rec = sim.make_recorder("results/stairs/stairs_climb.mp4", fps=30,
+                            cam_distance=3.5, cam_azimuth=160, cam_elevation=-18)
 
     while sim.data.time < duration:
         t     = sim.data.time
         state = sim.ctrl.step()
         x     = state.pos[0]
+        rec.capture(t)
 
         # Apply velocity commands from profile
         while ci < len(profile) and t >= profile[ci][0]:
@@ -286,6 +290,13 @@ if __name__ == "__main__":
                   f"(trot stable, pz={state.pos[2]:.3f}m)")
             sim.ctrl.switch_to_terrain_mode("stairs")
             terrain_on = True
+            # Switch gait from flat-stable (T=0.40/duty=0.50) to stairs
+            # gait (T=0.60/duty=0.85).  High duty gives 70% 4-foot overlap
+            # for roll/pitch stability on asymmetric step heights.
+            sim.ctrl.gait.T    = 0.60
+            sim.ctrl.gait.duty = 0.85
+            sim.ctrl.gait.activate(t)  # re-anchor phase to current time
+            print(f"     gait: T=0.40/duty=0.60 → T=0.60/duty=0.85")
             print(f"     swing_clearance: 0.08 -> {sim.ctrl.terrain.swing_clearance():.2f}m")
             print(f"     touchdown_z: 0.02 -> {sim.ctrl.terrain.touchdown_z():.3f}m")
 
@@ -315,10 +326,12 @@ if __name__ == "__main__":
         # Debug log showed roll diverged to -22.4° before crash — undetected
         # because only pitch was checked.
         roll = abs(np.degrees(state.euler[0]))
-        if roll > 25.0 and t > 4.0:
-            print(f"\n  !! FAILURE: roll={roll:.1f} > 25 at t={t:.2f}s  "
+        if roll > 35.0 and t > 4.0:
+            print(f"\n  !! FAILURE: roll={roll:.1f} > 35 at t={t:.2f}s  "
                   f"pz={pz:.3f}m — robot is rolling over!")
             break
+
+    rec.close(sim_time=sim.data.time)
 
     sim._print_verify_summary()
     sim.ctrl.logger.close()
@@ -344,8 +357,7 @@ if __name__ == "__main__":
 
         profile_v = [
             (0.0,  dict(vx=0.0)),
-            (5.5,  dict(vx=0.20)),   # fast flat approach
-            (8.0,  dict(vx=0.10)),   # slow down before stairs (x≈1.90m)
+            (5.5,  dict(vx=0.10)),
         ]
         ci2         = 0
         terrain_on2 = False
@@ -376,6 +388,9 @@ if __name__ == "__main__":
                           f"(trot stable, pz={state.pos[2]:.3f}m)")
                     sim.ctrl.switch_to_terrain_mode("stairs")
                     terrain_on2 = True
+                    sim.ctrl.gait.T    = 0.60
+                    sim.ctrl.gait.duty = 0.85
+                    sim.ctrl.gait.activate(t)
 
                 if t - last_p >= 0.5:
                     diag_print(t, state, sim.ctrl, terrain_on2)

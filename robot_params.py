@@ -14,9 +14,14 @@ class Go2Params:
     mass : float = 15.206408
     g    : float = 9.81
 
-    Ixx  : float = 0.107027
-    Iyy  : float = 0.0980771
-    Izz  : float = 0.0244531
+    # Effective trot inertia: between trunk-only and full composite.
+    # Trunk-only: [0.107, 0.098, 0.025] — underestimates by 2.8x/4.9x/18.7x.
+    # Full composite (standing): [0.300, 0.481, 0.458] — overestimates because
+    # swing legs are retracted during trot, reducing their moment contribution.
+    # Tuned to ~70% of composite for pitch/roll, empirically validated:
+    Ixx  : float = 0.220
+    Iyy  : float = 0.312
+    Izz  : float = 0.100
 
     # State order: [φ, θ, ψ,  px, py, pz,  ωx, ωy, ωz,  vx, vy, vz,  −g]
     #               0  1  2   3   4   5    6   7   8    9  10  11   12
@@ -32,22 +37,33 @@ class Go2Params:
     # Those caused the MPC to generate aggressive corrective forces that
     # destabilised the trot within 2 gait cycles (confirmed from debug log).
     # State order: [φ, θ, ψ,  px, py, pz,  ωx, ωy, ωz,  vx, vy, vz,  −g]
-    # Matched to CasADi reference (centroidal_mpc.py):
-    #   roll=10, pitch=20, yaw=1, px=1, py=1, pz=50→150,
-    #   wx=1, wy=5, wz=1, vx=2, vy=2, vz=5
+    # Based on CasADi reference (centroidal_mpc.py).
+    # Pitch drift (~5 deg at vx=0.4) is a known limitation of the SRBD model:
+    # the linearised dynamics don't capture leg-mass pitch coupling during
+    # diagonal stance.  Higher Q_pitch (35, 60) was tested but creates
+    # positive feedback through force-pitch coupling → faster divergence.
+    # The current weights are the empirically-stable sweet spot.
+    # State order: [φ, θ, ψ,  px, py, pz,  ωx, ωy, ωz,  vx, vy, vz,  −g]
+    # With corrected composite inertia (Iyy=0.312), the MPC generates
+    # adequate pitch-correcting forces with moderate Q weights.
+    # FIX: conservative yaw 1→2, vy 3→5, ωz 1→2 to reduce drift
+    # without destabilising the trot (larger jumps crashed at t=6).
+    # FIX: vx 8→15, vy 5→8 to prevent velocity surges during trot startup.
+    # At vx=8, speed overshoot to 0.25 m/s (from cmd=0.05) caused roll crash.
+    # At vx=15: penalty for 0.20 error = 0.60 (was 0.32) — 2x stronger.
     Q: np.ndarray = field(default_factory=lambda: np.array([
-          10., 20., 1.,
-            1.,  1., 150.,
-            1.,   5.,  1.,
-            2.,  2.,  5.,
+          20., 55., 2.,
+            1.,  1., 100.,
+            2.,  12.,  2.,
+           15.,   8.,  5.,
             0.
     ], dtype=float))
 
-    alpha: float = 3e-4
+    alpha: float = 5e-4
 
     mu   : float = 0.7
     f_min: float =  5.0
-    f_max: float = 200.0
+    f_max: float = 300.0
 
     @property
     def BI(self) -> np.ndarray:

@@ -57,7 +57,7 @@ HIP_X_OFFSET = 0.1934
 class TerrainEstimator:
 
     SWING_CLEARANCE_FLAT    = 0.08
-    SWING_CLEARANCE_TERRAIN = 0.18
+    SWING_CLEARANCE_TERRAIN = 0.12
     TOUCHDOWN_OFFSET        = 0.015
 
     def __init__(self, mode: str = "flat", smoothing: float = 0.70):
@@ -68,6 +68,7 @@ class TerrainEstimator:
         self._terrain_z  = 0.0
         self._foot_z     = np.zeros(4)
         self._foot_seen  = np.zeros(4, dtype=bool)
+        self._robot_x    = 0.0   # updated in update(), used by swing_clearance
 
     # ── Discrete stair height (step function) ─────────────────────────────────
 
@@ -245,15 +246,42 @@ class TerrainEstimator:
         if self.mode == "flat":
             return 0.0
 
-        # Guard: no phantom pitch before ascending stairs
-        if robot_x < STAIR_START_X:
+        # Guard: no phantom pitch before ascending stairs.
+        # FIX: Use a linear ramp-in from (STAIR_START_X - 0.15) to STAIR_START_X
+        # instead of a hard cutoff.  The hard cutoff caused pitch_ref to jump
+        # from 0° to +8.8° the instant the robot crossed x=2.0, but by then
+        # the physical pitch was already +6-7° from approach dynamics.
+        # The ramp-in lets the MPC anticipate the slope 0.15m (~2s at 0.08m/s)
+        # before stair contact, pre-tilting the body to match the terrain.
+        _RAMP_IN = 0.05
+        if robot_x < STAIR_START_X - _RAMP_IN:
             return 0.0
 
         front_z  = self.stair_height_smooth(robot_x + HIP_X_OFFSET)
         rear_z   = self.stair_height_smooth(robot_x - HIP_X_OFFSET)
         dz       = front_z - rear_z
         hip_span = 2.0 * HIP_X_OFFSET
-        return float(np.clip(np.arctan2(dz, hip_span), -0.21, 0.21))
+        # Cap pitch_ref to ±8.0° (0.14 rad).  The geometric stair slope
+        # between hips is arctan(0.06/0.387) = 8.8°.
+        #
+        # Previous cap at 0.09 (5.2°) created a 3.6° gap → MPC wasted force
+        # correcting terrain-induced pitch → roll coupling during 2-foot stance.
+        # Cap at 0.12 (6.9°) with Q=55 caused stumble at step 5 — the MPC's
+        # pitch correction during diagonal stance was still too aggressive.
+        #
+        # At 0.14 (8.0°), the gap to terrain slope is only 0.8°.  The MPC
+        # barely needs to correct pitch during ascent (error ~1° = 0.017 rad,
+        # penalty = 35×0.017² = 0.01 per step — negligible).  No roll coupling.
+        # On the platform (pitch_ref=0°), accumulated pitch is lower because
+        # the MPC wasn't fighting terrain during ascent.
+        raw_pitch = float(np.clip(np.arctan2(dz, hip_span), -0.14, 0.14))
+
+        # Linear ramp-in within the guard zone
+        if robot_x < STAIR_START_X:
+            alpha = (robot_x - (STAIR_START_X - _RAMP_IN)) / _RAMP_IN
+            return raw_pitch * alpha
+
+        return raw_pitch
 
     def target_pz(self, robot_x: float, nominal_clearance: float) -> float:
         """
@@ -290,21 +318,22 @@ class TerrainEstimator:
         """
         Update IIR terrain height estimate from stance foot z-positions.
 
-        During ascent:  terrain_z tracks UP   (0.0 → 0.30 m).
-        During descent: terrain_z tracks DOWN (0.30 → 0.0 m).
-
-        The IIR filter (alpha=0.70) prevents single-step spikes from
-        causing large force impulses in the swing clearance calculation.
+        FIX: Use MIN of stance foot z instead of MEAN.  The previous MEAN
+        was contaminated by the robot's own pitch: front feet higher from
+        pitch → terrain_z increases → swing_clearance increases → more pitch
+        → positive feedback loop.  MIN gives the actual ground level under
+        the lowest foot, which is the true terrain reference.
         """
         if self.mode == "flat":
             return
+        self._robot_x = state.pos[0]   # store for swing_clearance()
         for i in range(NUM_LEGS):
             if state.cf[i] > CONTACT_THR:
                 self._foot_z[i]    = state.foot_pos[i][2]
                 self._foot_seen[i] = True
         if self._foot_seen.any():
             tracked_z = self._foot_z[self._foot_seen]
-            raw = max(0.0, float(np.mean(tracked_z)) - FOOT_RADIUS)
+            raw = max(0.0, float(np.min(tracked_z)) - FOOT_RADIUS)
             self._terrain_z = (self._alpha * self._terrain_z
                                + (1.0 - self._alpha) * raw)
         dbg(4, f"TerrainEst [{self.mode}]: "
@@ -315,6 +344,7 @@ class TerrainEstimator:
         self._terrain_z    = 0.0
         self._foot_z[:]    = 0.0
         self._foot_seen[:] = False
+        self._robot_x      = 0.0
 
     def set_mode(self, mode: str) -> None:
         assert mode in ("flat", "stairs", "uneven"), \
@@ -334,24 +364,31 @@ class TerrainEstimator:
 
     def swing_clearance(self) -> float:
         """
-        Adaptive swing clearance based on IIR terrain height.
+        Adaptive swing clearance based on GEOMETRIC stair height.
 
-        Ascent:   terrain_z rises 0→0.30m, clearance scales 0.09→0.18m.
-        Descent:  terrain_z falls 0.30→0m, clearance scales 0.18→0.09m.
+        FIX: Previously used IIR terrain_z which was contaminated by the
+        robot's own pitch, causing a positive feedback loop:
+          pitch → front feet higher → terrain_z ↑ → clearance ↑ → more pitch
+        Now uses stair_height(robot_x) which is deterministic and independent
+        of robot orientation.
 
-        The adaptive behaviour is correct for both directions: the foot needs
-        clearance above the TARGET surface (which the IIR tracks), not above
-        the surface it is departing from.
+        On flat approach (x < STAIR_START_X): stays at flat clearance (0.08m).
+        On stairs: ramps to 0.18m based on geometric step height.
 
         flat mode: always 0.08m (unchanged from original).
         """
         if self.mode == "flat":
             return self.SWING_CLEARANCE_FLAT
 
-        t_z = max(0.0, self._terrain_z)
+        # Use geometric stair height, NOT IIR terrain_z
+        geo_z = self.stair_height(self._robot_x)
+
+        # On flat approach before stairs: keep flat clearance
+        if geo_z < 0.01:
+            return self.SWING_CLEARANCE_FLAT
 
         ramp_range = 0.10
-        extra = 0.01 + min(1.0, t_z / ramp_range) * (
+        extra = 0.01 + min(1.0, geo_z / ramp_range) * (
             self.SWING_CLEARANCE_TERRAIN - self.SWING_CLEARANCE_FLAT - 0.01
         )
         return self.SWING_CLEARANCE_FLAT + extra
