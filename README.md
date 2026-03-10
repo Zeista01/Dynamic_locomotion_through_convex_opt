@@ -26,12 +26,24 @@ See the full documentation here:
 
 ## Results
 
-| Scenario | Description |
-|---|---|
-| Flat trot | Stable diagonal trot, velocity ramp 0 → 0.6 m/s |
-| Stair climb | 5-step ascent + descent, adaptive CoM height and pitch |
+### Flat Trot
 
-*See [`docs/`](docs/) for detailed plots and analysis.*
+<p align="center">
+  <img src="results/flat/plot_com_velocity.png" width="32%"/>
+  <img src="results/flat/plot_contacts.png" width="32%"/>
+  <img src="results/flat/plot_grf.png" width="32%"/>
+</p>
+
+### Stair Climb
+
+<p align="center">
+  <img src="results/stairs/plot_stairs_height_orientation.png" width="48%"/>
+  <img src="results/stairs/plot_stairs_grf.png" width="48%"/>
+</p>
+<p align="center">
+  <img src="results/stairs/plot_stairs_contact_balance.png" width="48%"/>
+  <img src="results/stairs/plot_stairs_foot_placement.png" width="48%"/>
+</p>
 
 ---
 
